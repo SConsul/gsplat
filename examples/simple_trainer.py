@@ -77,15 +77,15 @@ class Config:
     steps_scaler: float = 1.0
 
     # Number of training steps
-    max_steps: int = 30_000
+    max_steps: int = 100_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [1000, 7_000, 30_000, 70_000, 100_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [1000, 7_000, 30_000, 70_000, 100_000])
     # Whether to save ply file (storage size can be large)
     save_ply: bool = False
     # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    ply_steps: List[int] = field(default_factory=lambda: [1000, 7_000, 30_000, 70_000, 100_000])
     # Whether to disable video generation during training and evaluation
     disable_video: bool = False
 
@@ -125,7 +125,7 @@ class Config:
     antialiased: bool = False
 
     # Use random background for training to discourage transparency
-    random_bkgd: bool = False
+    random_bkgd: bool = True
 
     # LR for 3D point positions
     means_lr: float = 1.6e-4
@@ -472,6 +472,13 @@ class Runner:
         # Viewer
         if not self.cfg.disable_viewer:
             self.server = viser.ViserServer(port=cfg.port, verbose=False)
+            self.server.scene.world_axes.visible = True
+            gui_up = self.server.gui.add_vector3(
+                "Up Direction",
+                initial_value=(0.0, 0.0, -1.0),
+                step=0.01,
+            )
+            self.server.scene.set_up_direction(gui_up.value)
             self.viewer = GsplatViewer(
                 server=self.server,
                 render_fn=self._viewer_render_fn,
