@@ -190,11 +190,27 @@ class Parser:
         # so we need to map between the two sorted lists of files.
         colmap_files = sorted(_get_rel_paths(colmap_image_dir))
         image_files = sorted(_get_rel_paths(image_dir))
-        if factor > 1 and os.path.splitext(image_files[0])[1].lower() == ".jpg":
+        
+        # Check if image directories are empty
+        if len(colmap_files) == 0:
+            raise ValueError(f"Image folder {colmap_image_dir} is empty. No images found.")
+        if len(image_files) == 0:
+            raise ValueError(f"Image folder {image_dir} is empty. No images found.")
+        
+        if factor > 1 and len(image_files) > 0 and os.path.splitext(image_files[0])[1].lower() == ".jpg":
             image_dir = _resize_image_folder(
                 colmap_image_dir, image_dir + "_png", factor=factor
             )
             image_files = sorted(_get_rel_paths(image_dir))
+        
+        # Ensure we have matching number of files
+        if len(colmap_files) != len(image_files):
+            raise ValueError(
+                f"Mismatch between COLMAP images ({len(colmap_files)}) and "
+                f"image directory files ({len(image_files)}). "
+                f"COLMAP dir: {colmap_image_dir}, Image dir: {image_dir}"
+            )
+        
         colmap_to_image = dict(zip(colmap_files, image_files))
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
 
@@ -357,16 +373,28 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        load_masks: bool = False,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+        self.load_masks = load_masks
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
         else:
             self.indices = indices[indices % self.parser.test_every == 0]
+        
+        # Check for masks directory
+        self.mask_dir = None
+        if load_masks:
+            mask_dir = os.path.join(parser.data_dir, "masks")
+            if os.path.exists(mask_dir):
+                self.mask_dir = mask_dir
+                print(f"[Dataset] Loading masks from {mask_dir}")
+            else:
+                print(f"[Dataset] Warning: load_masks=True but {mask_dir} does not exist")
 
     def __len__(self):
         return len(self.indices)
@@ -405,6 +433,45 @@ class Dataset:
             "image": torch.from_numpy(image).float(),
             "image_id": item,  # the index of the image in the dataset
         }
+        
+        # Load custom mask from masks folder if available
+        if self.mask_dir is not None:
+            image_name = self.parser.image_names[index]
+            # Try common mask file extensions
+            mask_name_base = os.path.splitext(image_name)[0]
+            mask_path = None
+            candidate = os.path.join(self.mask_dir, mask_name_base + ".jpg.png")
+            if os.path.exists(candidate):
+                mask_path = candidate
+            
+            if mask_path is not None:
+                custom_mask = imageio.imread(mask_path)
+                # Handle different mask formats (grayscale or RGB)
+                if len(custom_mask.shape) == 3:
+                    custom_mask = custom_mask[..., 0]  # Take first channel
+                # Resize mask if needed to match image size
+                if custom_mask.shape[:2] != image.shape[:2]:
+                    print(f"[Mask] Resizing mask from {custom_mask.shape[:2]} to {image.shape[:2]}")
+                    custom_mask = np.array(
+                        Image.fromarray(custom_mask).resize(
+                            (image.shape[1], image.shape[0]), Image.NEAREST
+                        )
+                    )
+                # Convert to boolean: nonzero = valid region
+                custom_mask = custom_mask > 0
+                # Debug: print mask stats for first few images
+                if item < 3 or (item % 500 == 0):
+                    valid_pct = 100 * custom_mask.sum() / custom_mask.size
+                    print(f"[Mask] {image_name}: {custom_mask.sum()}/{custom_mask.size} valid pixels ({valid_pct:.1f}%)")
+                # Combine with existing mask (e.g., from undistortion)
+                if mask is not None:
+                    mask = mask & custom_mask
+                else:
+                    mask = custom_mask
+            else:
+                if item < 3:
+                    print(f"[Mask] Warning: No mask found for {image_name} at {candidate}")
+        
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
 

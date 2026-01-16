@@ -40,12 +40,100 @@ from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
 
+def masked_ssim(
+    img1: Tensor,
+    img2: Tensor, 
+    mask: Tensor,
+    window_size: int = 11,
+    C1: float = 0.01 ** 2,
+    C2: float = 0.03 ** 2,  
+) -> Tensor:
+    """
+    Compute SSIM loss only on masked (valid) regions.
+    
+    Args:
+        img1: Rendered image [B, C, H, W]
+        img2: Ground truth image [B, C, H, W]
+        mask: Valid region mask [B, H, W], True = valid
+        window_size: SSIM window size
+        C1, C2: SSIM constants for stability
+    
+    Returns:
+        Scalar SSIM loss (1 - SSIM) averaged over valid pixels only
+    """
+    B, C, H, W = img1.shape
+    device = img1.device
+    
+    # Create Gaussian window
+    def gaussian_window(size, sigma=1.5):
+        coords = torch.arange(size, dtype=torch.float32, device=device) - size // 2
+        g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+        g = g / g.sum()
+        return g.outer(g)
+    
+    window = gaussian_window(window_size)
+    window = window.expand(C, 1, window_size, window_size)
+    
+    pad = window_size // 2
+    
+    # Compute local means
+    mu1 = F.conv2d(img1, window, padding=pad, groups=C)
+    mu2 = F.conv2d(img2, window, padding=pad, groups=C)
+    
+    mu1_sq = mu1 ** 2
+    mu2_sq = mu2 ** 2
+    mu1_mu2 = mu1 * mu2
+    
+    # Compute local variances and covariance
+    sigma1_sq = F.conv2d(img1 ** 2, window, padding=pad, groups=C) - mu1_sq
+    sigma2_sq = F.conv2d(img2 ** 2, window, padding=pad, groups=C) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, window, padding=pad, groups=C) - mu1_mu2
+    
+    # Clamp variances to avoid numerical issues
+    sigma1_sq = torch.clamp(sigma1_sq, min=0)
+    sigma2_sq = torch.clamp(sigma2_sq, min=0)
+    
+    # SSIM formula
+    numerator = (2 * mu1_mu2 + C1) * (2 * sigma12 + C2)
+    denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
+    ssim_map = numerator / denominator  # [B, C, H, W]
+    
+    # Average over channels to get per-pixel SSIM
+    ssim_map = ssim_map.mean(dim=1)  # [B, H, W]
+    
+    # Also compute mask weight map: how much of each SSIM window is valid
+    # This downweights SSIM values at mask boundaries
+    mask_float = mask.float().unsqueeze(1)  # [B, 1, H, W]
+    window_1ch = window[0:1]  # [1, 1, window_size, window_size]
+    mask_weight = F.conv2d(mask_float, window_1ch, padding=pad)  # [B, 1, H, W]
+    mask_weight = mask_weight.squeeze(1)  # [B, H, W]
+    
+    # Only include pixels where the window is mostly valid (>50% valid pixels)
+    valid_ssim_mask = (mask_weight > 0.5) & mask
+    
+    if valid_ssim_mask.sum() == 0:
+        # No valid pixels, return 0 loss
+        return torch.tensor(0.0, device=device, requires_grad=True)
+    
+    # Compute weighted SSIM loss only on valid regions
+    # Weight by how much of the window is valid
+    weights = mask_weight[valid_ssim_mask]
+    ssim_values = ssim_map[valid_ssim_mask]
+    
+    # Weighted average
+    ssim_score = (ssim_values * weights).sum() / weights.sum()
+    
+    return 1.0 - ssim_score
+
+
 @dataclass
 class Config:
     # Disable viewer
     disable_viewer: bool = False
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
+    # Path to a training checkpoint to resume from (rank-specific file).
+    resume_ckpt: Optional[str] = None
     # Name of compression strategy to use
     compression: Optional[Literal["png"]] = None
     # Render trajectory path
@@ -172,6 +260,9 @@ class Config:
     depth_loss: bool = False
     # Weight for depth loss
     depth_lambda: float = 1e-2
+
+    # Load masks from masks/ folder to ignore regions during training
+    load_masks: bool = False
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
@@ -342,8 +433,9 @@ class Runner:
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
+            load_masks=cfg.load_masks,
         )
-        self.valset = Dataset(self.parser, split="val")
+        self.valset = Dataset(self.parser, split="val", load_masks=cfg.load_masks)
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -545,9 +637,81 @@ class Runner:
             with_eval3d=self.cfg.with_eval3d,
             **kwargs,
         )
-        if masks is not None:
-            render_colors[~masks] = 0
+        # Note: Don't modify render_colors/alphas here - it breaks autograd
+        # Mask handling is done in the training loop
         return render_colors, render_alphas, info
+
+    def _load_resume_checkpoint(self, path: str) -> int:
+        """Load model + optimizer state for resuming training."""
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        
+        # Replace splat parameters directly to handle size changes from densification
+        for k in self.splats.keys():
+            self.splats[k] = torch.nn.Parameter(ckpt["splats"][k].to(self.device))
+        
+        # Recreate optimizers with correct parameter references and load state
+        cfg = self.cfg
+        BS = cfg.batch_size * self.world_size
+        optimizer_class = None
+        if cfg.sparse_grad:
+            optimizer_class = torch.optim.SparseAdam
+        elif cfg.visible_adam:
+            optimizer_class = SelectiveAdam
+        else:
+            optimizer_class = torch.optim.Adam
+        
+        lr_dict = {
+            "means": cfg.means_lr * self.scene_scale,
+            "scales": cfg.scales_lr,
+            "quats": cfg.quats_lr,
+            "opacities": cfg.opacities_lr,
+            "sh0": cfg.sh0_lr,
+            "shN": cfg.shN_lr,
+        }
+        
+        for name in self.optimizers.keys():
+            lr = lr_dict.get(name, cfg.sh0_lr)
+            self.optimizers[name] = optimizer_class(
+                [{"params": self.splats[name], "lr": lr * math.sqrt(BS), "name": name}],
+                eps=1e-15 / math.sqrt(BS),
+                betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+            )
+        
+        if "optimizers" in ckpt:
+            for name, state in ckpt["optimizers"].items():
+                if name in self.optimizers:
+                    self.optimizers[name].load_state_dict(state)
+
+        if self.cfg.pose_opt and "pose_adjust" in ckpt:
+            if isinstance(self.pose_adjust, torch.nn.parallel.DistributedDataParallel):
+                self.pose_adjust.module.load_state_dict(ckpt["pose_adjust"])
+            else:
+                self.pose_adjust.load_state_dict(ckpt["pose_adjust"])
+        if self.cfg.pose_opt and "pose_optimizers" in ckpt:
+            for opt, state in zip(self.pose_optimizers, ckpt["pose_optimizers"]):
+                opt.load_state_dict(state)
+
+        if self.cfg.app_opt and "app_module" in ckpt:
+            if isinstance(self.app_module, torch.nn.parallel.DistributedDataParallel):
+                self.app_module.module.load_state_dict(ckpt["app_module"])
+            else:
+                self.app_module.load_state_dict(ckpt["app_module"])
+        if self.cfg.app_opt and "app_optimizers" in ckpt:
+            for opt, state in zip(self.app_optimizers, ckpt["app_optimizers"]):
+                opt.load_state_dict(state)
+
+        if self.cfg.use_bilateral_grid and "bil_grids" in ckpt:
+            self.bil_grids.load_state_dict(ckpt["bil_grids"])
+        if self.cfg.use_bilateral_grid and "bil_grid_optimizers" in ckpt:
+            for opt, state in zip(self.bil_grid_optimizers, ckpt["bil_grid_optimizers"]):
+                opt.load_state_dict(state)
+
+        # Strategy-specific state (e.g., densification counters)
+        self.strategy_state = ckpt.get("strategy_state", self.strategy_state)
+
+        step = ckpt.get("step", -1) + 1
+        print(f"Resumed from {path} at step {step}")
+        return step
 
     def train(self):
         cfg = self.cfg
@@ -562,18 +726,29 @@ class Runner:
 
         max_steps = cfg.max_steps
         init_step = 0
+        if cfg.resume_ckpt is not None:
+            init_step = self._load_resume_checkpoint(cfg.resume_ckpt)
+            if init_step >= max_steps:
+                print(
+                    f"Warning: resume step {init_step} >= max_steps {max_steps}. "
+                    "Training will continue but no steps will run."
+                )
 
         schedulers = [
             # means has a learning rate schedule, that end at 0.01 of the initial value
             torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
+                self.optimizers["means"],
+                gamma=0.01 ** (1.0 / max_steps),
+                last_epoch=init_step - 1,
             ),
         ]
         if cfg.pose_opt:
             # pose optimization has a learning rate schedule
             schedulers.append(
                 torch.optim.lr_scheduler.ExponentialLR(
-                    self.pose_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
+                    self.pose_optimizers[0],
+                    gamma=0.01 ** (1.0 / max_steps),
+                    last_epoch=init_step - 1,
                 )
             )
         if cfg.use_bilateral_grid:
@@ -585,9 +760,12 @@ class Runner:
                             self.bil_grid_optimizers[0],
                             start_factor=0.01,
                             total_iters=1000,
+                            last_epoch=init_step - 1,
                         ),
                         torch.optim.lr_scheduler.ExponentialLR(
-                            self.bil_grid_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
+                            self.bil_grid_optimizers[0],
+                            gamma=0.01 ** (1.0 / max_steps),
+                            last_epoch=init_step - 1,
                         ),
                     ]
                 )
@@ -605,7 +783,7 @@ class Runner:
 
         # Training loop.
         global_tic = time.time()
-        pbar = tqdm.tqdm(range(init_step, max_steps))
+        pbar = tqdm.tqdm(range(init_step, max_steps), initial=init_step, total=max_steps)
         for step in pbar:
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
@@ -687,27 +865,51 @@ class Runner:
             )
 
             # loss
-            l1loss = F.l1_loss(colors, pixels)
-            ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-            )
+            if masks is not None:
+                # Debug: print mask stats on first step
+                if step == 0:
+                    print(f"[Mask Debug] Mask shape: {masks.shape}, "
+                          f"Valid pixels: {masks.sum().item()}/{masks.numel()} "
+                          f"({100*masks.sum().item()/masks.numel():.1f}%)")
+                
+                # Apply mask: only compute loss on valid regions (mask=True)
+                # Expand mask to match color channels [B, H, W] -> [B, H, W, 3]
+                mask_expanded = masks.unsqueeze(-1).expand_as(colors)
+                
+                # L1 loss: only on valid pixels
+                l1loss = (colors[mask_expanded] - pixels[mask_expanded]).abs().mean()
+                
+                # SSIM loss: Use proper masked SSIM that excludes invalid pixels from
+                # window statistics and only averages over valid regions
+                ssimloss = masked_ssim(
+                    colors.permute(0, 3, 1, 2),  # [B, C, H, W]
+                    pixels.permute(0, 3, 1, 2),  # [B, C, H, W]
+                    masks,  # [B, H, W]
+                )
+            else:
+                l1loss = F.l1_loss(colors, pixels)
+                ssimloss = 1.0 - fused_ssim(
+                    colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             if cfg.depth_loss:
+                # Depth loss uses SfM points - these are valid 3D geometry
+                # We don't filter by mask since depth is in 3D space, not pixel space
                 # query depths from depth map
-                points = torch.stack(
+                points_norm = torch.stack(
                     [
                         points[:, :, 0] / (width - 1) * 2 - 1,
                         points[:, :, 1] / (height - 1) * 2 - 1,
                     ],
                     dim=-1,
                 )  # normalize to [-1, 1]
-                grid = points.unsqueeze(2)  # [1, M, 1, 2]
-                depths = F.grid_sample(
+                grid = points_norm.unsqueeze(2)  # [1, M, 1, 2]
+                sampled_depths = F.grid_sample(
                     depths.permute(0, 3, 1, 2), grid, align_corners=True
                 )  # [1, 1, M, 1]
-                depths = depths.squeeze(3).squeeze(1)  # [1, M]
+                sampled_depths = sampled_depths.squeeze(3).squeeze(1)  # [1, M]
                 # calculate loss in disparity space
-                disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
+                disp = torch.where(sampled_depths > 0.0, 1.0 / sampled_depths, torch.zeros_like(sampled_depths))
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
@@ -772,17 +974,35 @@ class Runner:
                     "w",
                 ) as f:
                     json.dump(stats, f)
-                data = {"step": step, "splats": self.splats.state_dict()}
+                data = {
+                    "step": step,
+                    "splats": self.splats.state_dict(),
+                    "optimizers": {
+                        name: opt.state_dict() for name, opt in self.optimizers.items()
+                    },
+                    "strategy_state": self.strategy_state,
+                }
                 if cfg.pose_opt:
                     if world_size > 1:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
                     else:
                         data["pose_adjust"] = self.pose_adjust.state_dict()
+                    data["pose_optimizers"] = [
+                        opt.state_dict() for opt in self.pose_optimizers
+                    ]
                 if cfg.app_opt:
                     if world_size > 1:
                         data["app_module"] = self.app_module.module.state_dict()
                     else:
                         data["app_module"] = self.app_module.state_dict()
+                    data["app_optimizers"] = [
+                        opt.state_dict() for opt in self.app_optimizers
+                    ]
+                if cfg.use_bilateral_grid:
+                    data["bil_grids"] = self.bil_grids.state_dict()
+                    data["bil_grid_optimizers"] = [
+                        opt.state_dict() for opt in self.bil_grid_optimizers
+                    ]
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
