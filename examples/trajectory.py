@@ -782,7 +782,7 @@ def ensure_4x4(camtoworlds: np.ndarray) -> np.ndarray:
 
 def generate_trajectory_from_parser(
     parser: Parser,
-    traj_type: Literal["interp", "ellipse", "spiral", "wall", "elevated"] = "interp",
+    traj_type: Literal["interp", "ellipse", "spiral", "wall", "elevated", "colmap"] = "interp",
     n_frames: Optional[int] = None,
     scene_scale: float = 1.0,
     wall_height: Optional[float] = None,
@@ -791,6 +791,7 @@ def generate_trajectory_from_parser(
     wall_shape: Literal["rectangle", "ellipse"] = "ellipse",
     elevated_subsample: int = 1,
     elevated_look_at_center: bool = True,
+    colmap_interp: int = 1,
 ) -> np.ndarray:
     """
     Generate a camera trajectory from a Parser, replicating render_traj logic.
@@ -806,6 +807,7 @@ def generate_trajectory_from_parser(
         wall_shape: Path shape for wall trajectory ("rectangle" or "ellipse")
         elevated_subsample: Use every nth camera for elevated trajectory
         elevated_look_at_center: If True, elevated cameras face scene center
+        colmap_interp: Interpolation factor for colmap trajectory (1 = use original poses)
     
     Returns:
         Camera to world transforms [N, 4, 4]
@@ -853,6 +855,13 @@ def generate_trajectory_from_parser(
             subsample=elevated_subsample,
             look_at_center=elevated_look_at_center,
         )
+    elif traj_type == "colmap":
+        # Use original COLMAP camera poses directly (all poses, not trimmed)
+        camtoworlds_all = parser.camtoworlds.copy()
+        if colmap_interp > 1:
+            # Optionally interpolate between original poses
+            camtoworlds_all = generate_interpolated_path(camtoworlds_all, colmap_interp)
+        print(f"Using original COLMAP camera poses: {len(camtoworlds_all)} poses")
     else:
         raise ValueError(f"Unknown trajectory type: {traj_type}")
     
@@ -864,7 +873,7 @@ def generate_trajectory_from_parser(
 
 def generate_render_traj_offset_up(
     parser: Parser,
-    traj_type: Literal["interp", "ellipse", "spiral", "wall", "elevated"] = "interp",
+    traj_type: Literal["interp", "ellipse", "spiral", "wall", "elevated", "colmap"] = "interp",
     up_offset_meters: float = 0.1,
     scene_scale: float = 1.0,
     n_frames: Optional[int] = None,
@@ -874,6 +883,7 @@ def generate_render_traj_offset_up(
     wall_shape: Literal["rectangle", "ellipse"] = "ellipse",
     elevated_subsample: int = 1,
     elevated_look_at_center: bool = True,
+    colmap_interp: int = 1,
 ) -> np.ndarray:
     """
     Generate a trajectory like render_traj but with camera moved up.
@@ -884,7 +894,7 @@ def generate_render_traj_offset_up(
     
     Args:
         parser: COLMAP Parser with camera poses
-        traj_type: Type of trajectory ("interp", "ellipse", "spiral", "wall", "elevated")
+        traj_type: Type of trajectory ("interp", "ellipse", "spiral", "wall", "elevated", "colmap")
         up_offset_meters: How much to move camera up in meters (positive = up)
         scene_scale: Scene scale factor (important if scene is normalized!)
         n_frames: Number of frames (None uses defaults)
@@ -894,6 +904,7 @@ def generate_render_traj_offset_up(
         wall_shape: Path shape for wall trajectory
         elevated_subsample: Use every nth camera for elevated trajectory
         elevated_look_at_center: If True, elevated cameras face scene center
+        colmap_interp: Interpolation factor for colmap trajectory (1 = use original poses)
     
     Returns:
         Camera to world transforms [N, 4, 4] with upward offset applied
@@ -915,6 +926,7 @@ def generate_render_traj_offset_up(
         wall_shape=wall_shape,
         elevated_subsample=elevated_subsample,
         elevated_look_at_center=elevated_look_at_center,
+        colmap_interp=colmap_interp,
     )
     
     # Apply upward offset (up is -Z in gsplat coordinate system)
@@ -1430,7 +1442,7 @@ if __name__ == "__main__":
     arg_parser.add_argument("--data-dir", type=str, required=True, help="Path to COLMAP dataset")
     arg_parser.add_argument("--up-offset", type=float, default=0.1, help="Up offset in meters")
     arg_parser.add_argument("--traj-type", type=str, default="interp", 
-                           choices=["interp", "ellipse", "spiral", "wall", "elevated"])
+                           choices=["interp", "ellipse", "spiral", "wall", "elevated", "colmap"])
     arg_parser.add_argument("--save-image", type=str, default=None, 
                            help="Save image instead of interactive view")
     

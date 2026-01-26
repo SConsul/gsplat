@@ -866,19 +866,16 @@ class Runner:
 
             # loss
             if masks is not None:
-                # Debug: print mask stats on first step
-                if step == 0:
-                    print(f"[Mask Debug] Mask shape: {masks.shape}, "
-                          f"Valid pixels: {masks.sum().item()}/{masks.numel()} "
-                          f"({100*masks.sum().item()/masks.numel():.1f}%)")
-                
                 # Apply mask: only compute loss on valid regions (mask=True)
                 # Expand mask to match color channels [B, H, W] -> [B, H, W, 3]
                 mask_expanded = masks.unsqueeze(-1).expand_as(colors)
-                
+
                 # L1 loss: only on valid pixels
-                l1loss = (colors[mask_expanded] - pixels[mask_expanded]).abs().mean()
-                
+                if mask_expanded.sum() == 0:
+                    l1loss = torch.tensor(0.0, device=colors.device, requires_grad=True)
+                else:
+                    l1loss = (colors[mask_expanded] - pixels[mask_expanded]).abs().mean()
+
                 # SSIM loss: Use proper masked SSIM that excludes invalid pixels from
                 # window statistics and only averages over valid regions
                 ssimloss = masked_ssim(
@@ -893,26 +890,76 @@ class Runner:
                 )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             if cfg.depth_loss:
-                # Depth loss uses SfM points - these are valid 3D geometry
-                # We don't filter by mask since depth is in 3D space, not pixel space
-                # query depths from depth map
-                points_norm = torch.stack(
-                    [
-                        points[:, :, 0] / (width - 1) * 2 - 1,
-                        points[:, :, 1] / (height - 1) * 2 - 1,
-                    ],
-                    dim=-1,
-                )  # normalize to [-1, 1]
-                grid = points_norm.unsqueeze(2)  # [1, M, 1, 2]
-                sampled_depths = F.grid_sample(
-                    depths.permute(0, 3, 1, 2), grid, align_corners=True
-                )  # [1, 1, M, 1]
-                sampled_depths = sampled_depths.squeeze(3).squeeze(1)  # [1, M]
-                # calculate loss in disparity space
-                disp = torch.where(sampled_depths > 0.0, 1.0 / sampled_depths, torch.zeros_like(sampled_depths))
-                disp_gt = 1.0 / depths_gt  # [1, M]
-                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
-                loss += depthloss * cfg.depth_lambda
+                # Filter SfM points that fall in masked regions
+                # These points would sample invalid depths (0 or NaN)
+                depth_points = points  # [1, M, 2]
+                depth_depths_gt = depths_gt  # [1, M]
+
+                if masks is not None:
+                    # Get integer pixel coordinates for mask lookup
+                    px = depth_points[:, :, 0].long().clamp(0, width - 1)  # [1, M]
+                    py = depth_points[:, :, 1].long().clamp(0, height - 1)  # [1, M]
+                    # Check which points fall in valid (unmasked) regions
+                    # masks is [1, H, W], True = valid
+                    point_valid = masks[0, py[0], px[0]]  # [M]
+
+                    if point_valid.sum() == 0:
+                        # No valid points - skip depth loss for this batch
+                        depthloss = torch.tensor(0.0, device=device, requires_grad=True)
+                        loss += depthloss * cfg.depth_lambda
+                    else:
+                        # Filter to only valid points
+                        valid_indices = point_valid.nonzero(as_tuple=True)[0]
+                        depth_points = depth_points[:, valid_indices, :]  # [1, M', 2]
+                        depth_depths_gt = depth_depths_gt[:, valid_indices]  # [1, M']
+
+                        # query depths from depth map
+                        points_norm = torch.stack(
+                            [
+                                depth_points[:, :, 0] / (width - 1) * 2 - 1,
+                                depth_points[:, :, 1] / (height - 1) * 2 - 1,
+                            ],
+                            dim=-1,
+                        )  # normalize to [-1, 1]
+                        grid = points_norm.unsqueeze(2)  # [1, M', 1, 2]
+                        sampled_depths = F.grid_sample(
+                            depths.permute(0, 3, 1, 2), grid, align_corners=True
+                        )  # [1, 1, M', 1]
+                        sampled_depths = sampled_depths.squeeze(3).squeeze(1)  # [1, M']
+
+                        # calculate loss in disparity space
+                        # Filter out any remaining invalid depths (sampled_depths <= 0 or depths_gt <= 0)
+                        valid_depth_mask = (sampled_depths > 0) & (depth_depths_gt > 0)
+                        if valid_depth_mask.sum() == 0:
+                            depthloss = torch.tensor(0.0, device=device, requires_grad=True)
+                        else:
+                            disp = torch.where(valid_depth_mask, 1.0 / sampled_depths, torch.zeros_like(sampled_depths))
+                            disp_gt = torch.where(valid_depth_mask, 1.0 / depth_depths_gt, torch.zeros_like(depth_depths_gt))
+                            # Only compute loss on valid entries
+                            depthloss = (disp[valid_depth_mask] - disp_gt[valid_depth_mask]).abs().mean() * self.scene_scale
+
+                        loss += depthloss * cfg.depth_lambda
+                else:
+                    # No masking - original depth loss computation
+                    points_norm = torch.stack(
+                        [
+                            depth_points[:, :, 0] / (width - 1) * 2 - 1,
+                            depth_points[:, :, 1] / (height - 1) * 2 - 1,
+                        ],
+                        dim=-1,
+                    )  # normalize to [-1, 1]
+                    grid = points_norm.unsqueeze(2)  # [1, M, 1, 2]
+                    sampled_depths = F.grid_sample(
+                        depths.permute(0, 3, 1, 2), grid, align_corners=True
+                    )  # [1, 1, M, 1]
+                    sampled_depths = sampled_depths.squeeze(3).squeeze(1)  # [1, M]
+
+                    # calculate loss in disparity space
+                    disp = torch.where(sampled_depths > 0.0, 1.0 / sampled_depths, torch.zeros_like(sampled_depths))
+                    disp_gt = torch.where(depth_depths_gt > 0.0, 1.0 / depth_depths_gt, torch.zeros_like(depth_depths_gt))
+                    depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+
+                    loss += depthloss * cfg.depth_lambda
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss

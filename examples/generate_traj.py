@@ -11,6 +11,12 @@ Usage:
 
     # Render ellipse trajectory
     python generate_traj.py --data-dir /path/to/data --ckpt /path/to/ckpt.pt --output video.mp4 --traj-type ellipse
+
+    # Render using original COLMAP camera poses
+    python generate_traj.py --data-dir /path/to/data --ckpt /path/to/ckpt.pt --output video.mp4 --traj-type colmap
+
+    # Render using COLMAP poses with interpolation (smoother video)
+    python generate_traj.py --data-dir /path/to/data --ckpt /path/to/ckpt.pt --output video.mp4 --traj-type colmap --colmap-interp 3
 """
 
 from pathlib import Path
@@ -32,6 +38,159 @@ from trajectory import (
 )
 
 
+def _look_at_rotation(
+    camera_pos: np.ndarray,
+    target_xy: np.ndarray,
+    pitch_deg: float = -10.0,
+) -> np.ndarray:
+    """
+    Compute rotation matrix for camera looking towards target_xy (azimuth) with fixed pitch.
+    Camera convention: Z points from camera towards target, Y is up.
+    Returns 3x3 rotation matrix (camera-to-world).
+
+    Args:
+        camera_pos: 3D camera position
+        target_xy: 2D or 3D target position (only XY components used for azimuth)
+        pitch_deg: Pitch angle in degrees (positive = looking up)
+    """
+    # Compute azimuth direction from camera XY to target XY
+    camera_xy = camera_pos[:2]
+    target_2d = target_xy[:2]
+
+    azimuth_dir = target_2d - camera_xy
+    azimuth_len = np.linalg.norm(azimuth_dir)
+
+    if azimuth_len < 1e-8:
+        # Default to looking along +X if target is at camera position
+        azimuth_dir = np.array([1.0, 0.0])
+    else:
+        azimuth_dir = azimuth_dir / azimuth_len
+
+    # Convert pitch to radians (positive pitch = looking down)
+    pitch_rad = np.deg2rad(pitch_deg)
+
+    # Forward direction: azimuth in XY, tilted by pitch (positive = up)
+    forward = np.array(
+        [
+            azimuth_dir[0] * np.cos(pitch_rad),
+            azimuth_dir[1] * np.cos(pitch_rad),
+            np.sin(pitch_rad),
+        ]
+    )
+
+    # World up
+    world_up = np.array([0.0, 0.0, 1.0])
+
+    # Right = forward x up
+    right = np.cross(forward, world_up)
+    right_len = np.linalg.norm(right)
+    if right_len < 1e-8:
+        # Forward is parallel to world up (looking straight up or down)
+        right = np.array([1.0, 0.0, 0.0])
+    else:
+        right = right / right_len
+
+    # Up = right x forward
+    up = np.cross(right, forward)
+    up = up / np.linalg.norm(up)
+
+    # Camera-to-world rotation: columns are right, up, forward
+    # Z axis points from camera towards target
+    rotation = np.column_stack([right, up, forward])
+    return rotation
+
+
+def _build_trajectory_transforms(
+    positions: np.ndarray,
+    look_at_target: np.ndarray,
+    pitch_deg: float = -10.0,
+) -> np.ndarray:
+    """
+    Build camera-to-world 4x4 transforms for trajectory.
+    Each camera is at `positions[i]` and looks at `look_at_target` with `pitch_deg` downward.
+    Returns [N, 4, 4] array.
+    """
+    N = len(positions)
+    transforms = np.zeros((N, 4, 4), dtype=np.float64)
+
+    for i, pos in enumerate(positions):
+        R = _look_at_rotation(pos, look_at_target, pitch_deg)
+        T = np.eye(4, dtype=np.float64)
+        T[:3, :3] = R
+        T[:3, 3] = pos
+        transforms[i] = T
+
+    return transforms
+
+
+def transform_cameras(matrix: np.ndarray, camtoworlds: np.ndarray) -> np.ndarray:
+    """Transform cameras using an SE(3) matrix.
+
+    Args:
+        matrix: 4x4 SE(3) matrix
+        camtoworlds: Nx4x4 array of camera-to-world matrices
+
+    Returns:
+        Nx4x4 array of transformed camera-to-world matrices
+    """
+    assert matrix.shape == (4, 4)
+    assert len(camtoworlds.shape) == 3 and camtoworlds.shape[1:] == (4, 4)
+    camtoworlds = np.einsum("nij, ki -> nkj", camtoworlds, matrix)
+    scaling = np.linalg.norm(camtoworlds[:, 0, :3], axis=1)
+    camtoworlds[:, :3, :3] = camtoworlds[:, :3, :3] / scaling[:, None, None]
+    return camtoworlds
+
+
+def load_trajectory_from_json(
+    json_path: Path,
+    parser_transform: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Load trajectory from JSON file (produced by generate_trajectory.py).
+
+    The JSON contains:
+        - interpolated_trajectory: list of [x, y, z] positions
+        - look_at_target: [x, y, z] target point
+        - pitch_deg: camera pitch angle
+
+    Args:
+        json_path: Path to trajectory.json file
+        parser_transform: 4x4 transform matrix from Parser for normalization.
+                         If provided, the trajectory is transformed to match
+                         the normalized coordinate system used by gsplat.
+
+    Returns:
+        Camera to world transforms [N, 4, 4]
+    """
+    import json
+
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+
+    positions = np.array(data["interpolated_trajectory"])  # (200, 3)
+    mean_xy = positions[:, :2].mean(axis=0)                # (2,)
+    # bring the points 0.2 towards mean in XY
+    alpha = 0.2  # move 20% of the way toward mean
+    positions[:, :2] = positions[:, :2] + alpha * (mean_xy - positions[:, :2])
+    positions[:,2] = 0.8
+    look_at_target = np.array(data["look_at_target"])
+    pitch_deg = data.get("pitch_deg", -10.0)
+
+    print(f"  Loaded {len(positions)} positions from JSON")
+    print(f"  Look-at target: {look_at_target}")
+    print(f"  Pitch: {pitch_deg} degrees")
+
+    # Build 4x4 transforms from positions and orientation
+    transforms = _build_trajectory_transforms(positions, look_at_target, pitch_deg)
+
+    # Apply normalization transform if provided
+    if parser_transform is not None:
+        print(f"  Applying parser transform for normalization...")
+        transforms = transform_cameras(parser_transform, transforms)
+
+    return transforms
+
+
 def load_checkpoint(ckpt_path: str, device: str = "cuda") -> Tuple[torch.nn.ParameterDict, int]:
     """
     Load splats from checkpoint.
@@ -43,7 +202,7 @@ def load_checkpoint(ckpt_path: str, device: str = "cuda") -> Tuple[torch.nn.Para
     Returns:
         Tuple of (splats ParameterDict, step number)
     """
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     
     splats = torch.nn.ParameterDict()
     for k, v in ckpt["splats"].items():
@@ -559,6 +718,12 @@ Examples:
   # Render ellipse trajectory  
   python generate_traj.py --data-dir ./data --ckpt ./ckpts/ckpt.pt -o video.mp4 --traj-type ellipse
 
+  # Render using original COLMAP camera poses (from images.bin)
+  python generate_traj.py --data-dir ./data --ckpt ./ckpts/ckpt.pt -o video.mp4 --traj-type colmap
+
+  # Render using COLMAP poses with 3x interpolation for smoother video
+  python generate_traj.py --data-dir ./data --ckpt ./ckpts/ckpt.pt -o video.mp4 --traj-type colmap --colmap-interp 3
+
   # Save trajectory without rendering (no checkpoint needed)
   python generate_traj.py --data-dir ./data -o traj.npz --save-traj-only
         """
@@ -585,9 +750,15 @@ Examples:
     parser.add_argument(
         "--traj-type", 
         type=str,
-        choices=["interp", "ellipse", "spiral"],
+        choices=["interp", "ellipse", "spiral", "colmap"],
         default="interp",
-        help="Trajectory type (default: interp)"
+        help="Trajectory type (default: interp). 'colmap' uses original COLMAP camera poses."
+    )
+    parser.add_argument(
+        "--colmap-interp",
+        type=int,
+        default=1,
+        help="Interpolation factor for colmap trajectory (1 = use original poses, >1 = interpolate)"
     )
     parser.add_argument(
         "--traj-file",
@@ -744,7 +915,17 @@ Examples:
             print(f"  Example: --traj-file {Path.cwd() / 'my_traj.npy'}")
             raise FileNotFoundError(f"Trajectory file not found: {traj_path}")
         print(f"Loading trajectory from {traj_path}...")
-        original_camtoworlds = load_trajectory(traj_path, convert_zup=False)
+
+        if traj_path.suffix.lower() == ".json":
+            # Load from JSON (produced by generate_trajectory.py)
+            # Apply parser transform for normalization
+            original_camtoworlds = load_trajectory_from_json(
+                traj_path,
+                parser_transform=colmap_parser.transform,
+            )
+        else:
+            # Load from npy/npz
+            original_camtoworlds = load_trajectory(traj_path, convert_zup=False)
         print(f"Loaded {len(original_camtoworlds)} poses from file")
     else:
         # Generate trajectory from parser
@@ -754,6 +935,7 @@ Examples:
             traj_type=args.traj_type,
             n_frames=args.n_frames,
             scene_scale=_scene_scale,
+            colmap_interp=args.colmap_interp,
         )
     
     # Apply max_frames limit if specified
