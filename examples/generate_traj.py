@@ -750,7 +750,7 @@ Examples:
     parser.add_argument(
         "--traj-type", 
         type=str,
-        choices=["interp", "ellipse", "spiral", "colmap"],
+        choices=["interp", "ellipse", "spiral", "colmap", "elevated", "wall"],
         default="interp",
         help="Trajectory type (default: interp). 'colmap' uses original COLMAP camera poses."
     )
@@ -863,6 +863,24 @@ Examples:
         action="store_true",
         help="Flip images vertically (use if images appear upside down)"
     )
+    parser.add_argument(
+        "--apply-transform",
+        action="store_true",
+        help="Apply parser's normalization transform to loaded trajectory file. "
+             "Use this when loading raw trajectory files that weren't normalized."
+    )
+    parser.add_argument(
+        "--pitch",
+        type=float,
+        default=0.0,
+        help="Pitch of viewing"
+    )
+    parser.add_argument(
+        "--elevation",
+        type=float,
+        default=None,
+        help="elevateion of viewing"
+    )
     
     args = parser.parse_args()
     
@@ -926,6 +944,11 @@ Examples:
         else:
             # Load from npy/npz
             original_camtoworlds = load_trajectory(traj_path, convert_zup=False)
+            # Apply parser's normalization transform so the trajectory matches the splat
+            # This handles scenes where the Parser flipped the coordinate system
+            if args.apply_transform:
+                print(f"  Applying parser transform for normalization...")
+                original_camtoworlds = transform_cameras(colmap_parser.transform, original_camtoworlds)
         print(f"Loaded {len(original_camtoworlds)} poses from file")
     else:
         # Generate trajectory from parser
@@ -933,6 +956,8 @@ Examples:
         original_camtoworlds = generate_trajectory_from_parser(
             colmap_parser,
             traj_type=args.traj_type,
+            wall_height=args.elevation,
+            wall_pitch_degrees=args.pitch,
             n_frames=args.n_frames,
             scene_scale=_scene_scale,
             colmap_interp=args.colmap_interp,

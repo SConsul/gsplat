@@ -928,15 +928,23 @@ class Runner:
                         sampled_depths = sampled_depths.squeeze(3).squeeze(1)  # [1, M']
 
                         # calculate loss in disparity space
-                        # Filter out any remaining invalid depths (sampled_depths <= 0 or depths_gt <= 0)
-                        valid_depth_mask = (sampled_depths > 0) & (depth_depths_gt > 0)
+                        # Filter out invalid depths: must be positive and reasonable to avoid
+                        # NaN from division by very small values
+                        min_depth = 1e-4
+                        max_depth = 1000.0
+                        valid_depth_mask = (
+                            (sampled_depths > min_depth) & (sampled_depths < max_depth) &
+                            (depth_depths_gt > min_depth) & (depth_depths_gt < max_depth)
+                        )
                         if valid_depth_mask.sum() == 0:
                             depthloss = torch.tensor(0.0, device=device, requires_grad=True)
                         else:
-                            disp = torch.where(valid_depth_mask, 1.0 / sampled_depths, torch.zeros_like(sampled_depths))
-                            disp_gt = torch.where(valid_depth_mask, 1.0 / depth_depths_gt, torch.zeros_like(depth_depths_gt))
-                            # Only compute loss on valid entries
-                            depthloss = (disp[valid_depth_mask] - disp_gt[valid_depth_mask]).abs().mean() * self.scene_scale
+                            # Compute disparity only on valid entries
+                            valid_sampled = sampled_depths[valid_depth_mask]
+                            valid_gt = depth_depths_gt[valid_depth_mask]
+                            disp = 1.0 / valid_sampled
+                            disp_gt = 1.0 / valid_gt
+                            depthloss = (disp - disp_gt).abs().mean() * self.scene_scale
 
                         loss += depthloss * cfg.depth_lambda
                 else:
@@ -955,9 +963,23 @@ class Runner:
                     sampled_depths = sampled_depths.squeeze(3).squeeze(1)  # [1, M]
 
                     # calculate loss in disparity space
-                    disp = torch.where(sampled_depths > 0.0, 1.0 / sampled_depths, torch.zeros_like(sampled_depths))
-                    disp_gt = torch.where(depth_depths_gt > 0.0, 1.0 / depth_depths_gt, torch.zeros_like(depth_depths_gt))
-                    depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                    # Filter out invalid depths: must be positive and reasonable to avoid
+                    # NaN from division by very small values
+                    min_depth = 1e-4  # Avoid division by tiny values
+                    max_depth = 1000.0  # Filter extreme outliers
+                    valid_depth_mask = (
+                        (sampled_depths > min_depth) & (sampled_depths < max_depth) &
+                        (depth_depths_gt > min_depth) & (depth_depths_gt < max_depth)
+                    )
+                    if valid_depth_mask.sum() == 0:
+                        depthloss = torch.tensor(0.0, device=device, requires_grad=True)
+                    else:
+                        # Compute disparity only on valid entries
+                        valid_sampled = sampled_depths[valid_depth_mask]
+                        valid_gt = depth_depths_gt[valid_depth_mask]
+                        disp = 1.0 / valid_sampled
+                        disp_gt = 1.0 / valid_gt
+                        depthloss = (disp - disp_gt).abs().mean() * self.scene_scale
 
                     loss += depthloss * cfg.depth_lambda
             if cfg.use_bilateral_grid:
@@ -969,6 +991,25 @@ class Runner:
                 loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
             if cfg.scale_reg > 0.0:
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
+
+            # Check for NaN loss before backward to catch issues early
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n[Step {step}] NaN/Inf loss detected!")
+                print(f"  l1loss: {l1loss.item()}, ssimloss: {ssimloss.item()}")
+                if cfg.depth_loss:
+                    print(f"  depthloss: {depthloss.item()}")
+                # Check splat parameters
+                for name, param in self.splats.items():
+                    has_nan = torch.isnan(param).any().item()
+                    has_inf = torch.isinf(param).any().item()
+                    if has_nan or has_inf:
+                        print(f"  splats[{name}]: NaN={has_nan}, Inf={has_inf}")
+                        valid = param[~torch.isnan(param) & ~torch.isinf(param)]
+                        if valid.numel() > 0:
+                            print(f"    valid range: [{valid.min().item():.4g}, {valid.max().item():.4g}]")
+                # Skip this step's backward/optimizer to avoid corrupting parameters further
+                print("  Skipping backward pass for this step.")
+                continue
 
             loss.backward()
 
@@ -1131,6 +1172,12 @@ class Runner:
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
+
+            # Clamp scales to prevent numerical instability
+            # exp(scales) should not be too large to avoid ill-conditioned covariances
+            # max_log_scale=10 means max scale = exp(10) ≈ 22026
+            with torch.no_grad():
+                self.splats["scales"].clamp_(max=10.0)
 
             # Run post-backward steps after backward and optimizer
             if isinstance(self.cfg.strategy, DefaultStrategy):
