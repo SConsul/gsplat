@@ -261,8 +261,13 @@ class Config:
     # Weight for depth loss
     depth_lambda: float = 1e-2
 
-    # Load masks from masks/ folder to ignore regions during training
-    load_masks: bool = False
+    # where to load masks from folder to ignore regions during training
+    mask_dir: str | None = None
+    
+    # where to load masks from folder to reduce depth supervision during training
+    weak_mask_dir: str | None = None
+    
+    weak_depth_loss_multiplier: float = 0.3
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
@@ -433,9 +438,10 @@ class Runner:
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
-            load_masks=cfg.load_masks,
+            mask_dir=cfg.mask_dir,
+            weak_mask_dir=cfg.weak_mask_dir,
         )
-        self.valset = Dataset(self.parser, split="val", load_masks=cfg.load_masks)
+        self.valset = Dataset(self.parser, split="val", mask_dir=cfg.mask_dir, weak_mask_dir=None)
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -805,6 +811,7 @@ class Runner:
             )
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            weak_mask = data["weak_mask"].to(device) if "weak_mask" in data else None  # [1, H, W]
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
@@ -871,10 +878,7 @@ class Runner:
                 mask_expanded = masks.unsqueeze(-1).expand_as(colors)
 
                 # L1 loss: only on valid pixels
-                if mask_expanded.sum() == 0:
-                    l1loss = torch.tensor(0.0, device=colors.device, requires_grad=True)
-                else:
-                    l1loss = (colors[mask_expanded] - pixels[mask_expanded]).abs().mean()
+                l1loss = ((colors - pixels).abs()[mask_expanded].mean() if mask_expanded.any() else (colors - pixels).abs().sum() * 0.0)
 
                 # SSIM loss: Use proper masked SSIM that excludes invalid pixels from
                 # window statistics and only averages over valid regions
@@ -890,76 +894,38 @@ class Runner:
                 )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             if cfg.depth_loss:
-                # Filter SfM points that fall in masked regions
-                # These points would sample invalid depths (0 or NaN)
-                depth_points = points  # [1, M, 2]
-                depth_depths_gt = depths_gt  # [1, M]
+                # Depth loss uses SfM points - these are valid 3D geometry
+                # We don't filter by mask since depth is in 3D space, not pixel space
+                # query depths from depth map
+                points_norm = torch.stack(
+                    [
+                        points[:, :, 0] / (width - 1) * 2 - 1,
+                        points[:, :, 1] / (height - 1) * 2 - 1,
+                    ],
+                    dim=-1,
+                )  # normalize to [-1, 1]
+                grid = points_norm.unsqueeze(2)  # [1, M, 1, 2]
+                sampled_depths = F.grid_sample(
+                    depths.permute(0, 3, 1, 2), grid, align_corners=True
+                )  # [1, 1, M, 1]
+                sampled_depths = sampled_depths.squeeze(3).squeeze(1)  # [1, M]
+                sampled_weights = None
+                if weak_mask is not None:
+                    sampled_weights = F.grid_sample(
+                        weak_mask.permute(0, 3, 1, 2), grid, align_corners=True
+                    ).squeeze(3).squeeze(1)  # [1, M]
+                # calculate loss in disparity space
+                disp = torch.where(sampled_depths > 0.0, 1.0 / sampled_depths, torch.zeros_like(sampled_depths))
+                disp_gt = 1.0 / depths_gt  # [1, M]
+                
+                # weighted L1 loss
+                depth_diff = (disp - disp_gt).abs()
+                if weak_mask is not None:
+                    depth_diff = depth_diff * weak_mask 
+                depthloss = depth_diff.mean() * self.scene_scale
 
-                if masks is not None:
-                    # Get integer pixel coordinates for mask lookup
-                    px = depth_points[:, :, 0].long().clamp(0, width - 1)  # [1, M]
-                    py = depth_points[:, :, 1].long().clamp(0, height - 1)  # [1, M]
-                    # Check which points fall in valid (unmasked) regions
-                    # masks is [1, H, W], True = valid
-                    point_valid = masks[0, py[0], px[0]]  # [M]
+                loss += depthloss * cfg.depth_lambda
 
-                    if point_valid.sum() == 0:
-                        # No valid points - skip depth loss for this batch
-                        depthloss = torch.tensor(0.0, device=device, requires_grad=True)
-                        loss += depthloss * cfg.depth_lambda
-                    else:
-                        # Filter to only valid points
-                        valid_indices = point_valid.nonzero(as_tuple=True)[0]
-                        depth_points = depth_points[:, valid_indices, :]  # [1, M', 2]
-                        depth_depths_gt = depth_depths_gt[:, valid_indices]  # [1, M']
-
-                        # query depths from depth map
-                        points_norm = torch.stack(
-                            [
-                                depth_points[:, :, 0] / (width - 1) * 2 - 1,
-                                depth_points[:, :, 1] / (height - 1) * 2 - 1,
-                            ],
-                            dim=-1,
-                        )  # normalize to [-1, 1]
-                        grid = points_norm.unsqueeze(2)  # [1, M', 1, 2]
-                        sampled_depths = F.grid_sample(
-                            depths.permute(0, 3, 1, 2), grid, align_corners=True
-                        )  # [1, 1, M', 1]
-                        sampled_depths = sampled_depths.squeeze(3).squeeze(1)  # [1, M']
-
-                        # calculate loss in disparity space
-                        # Filter out any remaining invalid depths (sampled_depths <= 0 or depths_gt <= 0)
-                        valid_depth_mask = (sampled_depths > 0) & (depth_depths_gt > 0)
-                        if valid_depth_mask.sum() == 0:
-                            depthloss = torch.tensor(0.0, device=device, requires_grad=True)
-                        else:
-                            disp = torch.where(valid_depth_mask, 1.0 / sampled_depths, torch.zeros_like(sampled_depths))
-                            disp_gt = torch.where(valid_depth_mask, 1.0 / depth_depths_gt, torch.zeros_like(depth_depths_gt))
-                            # Only compute loss on valid entries
-                            depthloss = (disp[valid_depth_mask] - disp_gt[valid_depth_mask]).abs().mean() * self.scene_scale
-
-                        loss += depthloss * cfg.depth_lambda
-                else:
-                    # No masking - original depth loss computation
-                    points_norm = torch.stack(
-                        [
-                            depth_points[:, :, 0] / (width - 1) * 2 - 1,
-                            depth_points[:, :, 1] / (height - 1) * 2 - 1,
-                        ],
-                        dim=-1,
-                    )  # normalize to [-1, 1]
-                    grid = points_norm.unsqueeze(2)  # [1, M, 1, 2]
-                    sampled_depths = F.grid_sample(
-                        depths.permute(0, 3, 1, 2), grid, align_corners=True
-                    )  # [1, 1, M, 1]
-                    sampled_depths = sampled_depths.squeeze(3).squeeze(1)  # [1, M]
-
-                    # calculate loss in disparity space
-                    disp = torch.where(sampled_depths > 0.0, 1.0 / sampled_depths, torch.zeros_like(sampled_depths))
-                    disp_gt = torch.where(depth_depths_gt > 0.0, 1.0 / depth_depths_gt, torch.zeros_like(depth_depths_gt))
-                    depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
-
-                    loss += depthloss * cfg.depth_lambda
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss

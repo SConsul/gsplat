@@ -88,6 +88,7 @@ class Parser:
         params_dict = dict()
         imsize_dict = dict()  # width, height
         mask_dict = dict()
+        weak_mask_dict = dict()
         bottom = np.array([0, 0, 0, 1]).reshape(1, 4)
         for k in imdata:
             im = imdata[k]
@@ -134,6 +135,7 @@ class Parser:
             params_dict[camera_id] = params
             imsize_dict[camera_id] = (cam.width // factor, cam.height // factor)
             mask_dict[camera_id] = None
+            weak_mask_dict[camera_id] = None
         print(
             f"[Parser] {len(imdata)} images, taken by {len(set(camera_ids))} cameras."
         )
@@ -269,6 +271,7 @@ class Parser:
         self.params_dict = params_dict  # Dict of camera_id -> params
         self.imsize_dict = imsize_dict  # Dict of camera_id -> (width, height)
         self.mask_dict = mask_dict  # Dict of camera_id -> mask
+        self.weak_mask_dict = weak_mask_dict  # Dict of camera_id -> mask
         self.points = points  # np.ndarray, (num_points, 3)
         self.points_err = points_err  # np.ndarray, (num_points,)
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
@@ -311,6 +314,7 @@ class Parser:
                     K, params, None, K_undist, (width, height), cv2.CV_32FC1
                 )
                 mask = None
+                weak_mask = None
             elif camtype == "fisheye":
                 fx = K[0, 0]
                 fy = K[1, 1]
@@ -343,6 +347,7 @@ class Parser:
                 y_min, y_max = y_indices.min(), y_indices.max() + 1
                 x_min, x_max = x_indices.min(), x_indices.max() + 1
                 mask = mask[y_min:y_max, x_min:x_max]
+                weak_mask = None
                 K_undist = K.copy()
                 K_undist[0, 2] -= x_min
                 K_undist[1, 2] -= y_min
@@ -356,6 +361,7 @@ class Parser:
             self.roi_undist_dict[camera_id] = roi_undist
             self.imsize_dict[camera_id] = (roi_undist[2], roi_undist[3])
             self.mask_dict[camera_id] = mask
+            self.weak_mask_dict[camera_id] = weak_mask
 
         # size of the scene measured by cameras
         camera_locations = camtoworlds[:, :3, 3]
@@ -373,13 +379,14 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
-        load_masks: bool = False,
+        mask_dir: str | None = None,
+        weak_mask_dir: str | None = None,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
-        self.load_masks = load_masks
+
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
@@ -388,13 +395,22 @@ class Dataset:
         
         # Check for masks directory
         self.mask_dir = None
-        if load_masks:
-            mask_dir = os.path.join(parser.data_dir, "masks")
-            if os.path.exists(mask_dir):
-                self.mask_dir = mask_dir
-                print(f"[Dataset] Loading masks from {mask_dir}")
+        if mask_dir is not None:
+            full_mask_dir = os.path.join(parser.data_dir, mask_dir)
+            if os.path.exists(full_mask_dir):
+                self.mask_dir = full_mask_dir
+                print(f"[Dataset] Loading ignore masks from {full_mask_dir}")
             else:
-                print(f"[Dataset] Warning: load_masks=True but {mask_dir} does not exist")
+                print(f"[Dataset] Warning: mask_dir={mask_dir} but {full_mask_dir} does not exist")
+                
+        self.weak_mask_dir = None
+        if weak_mask_dir is not None:
+            full_mask_dir = os.path.join(parser.data_dir, weak_mask_dir)
+            if os.path.exists(full_mask_dir):
+                self.weak_mask_dir = full_mask_dir
+                print(f"[Dataset] Loading ignore masks from {full_mask_dir}")
+            else:
+                print(f"[Dataset] Warning: weak_mask_dir={weak_mask_dir} but {full_mask_dir} does not exist")
 
     def __len__(self):
         return len(self.indices)
@@ -407,6 +423,7 @@ class Dataset:
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
+        weak_mask = self.parser.weak_mask_dict[camera_id]
 
         if len(params) > 0:
             # Images are distorted. Undistort them.
@@ -436,41 +453,10 @@ class Dataset:
         
         # Load custom mask from masks folder if available
         if self.mask_dir is not None:
-            image_name = self.parser.image_names[index]
-            # Try common mask file extensions
-            mask_name_base = os.path.splitext(image_name)[0]
-            mask_path = None
-            candidate = os.path.join(self.mask_dir, mask_name_base + ".jpg.png")
-            if os.path.exists(candidate):
-                mask_path = candidate
+            mask = self.load_custom_mask(self.mask_dir, item, index, image, mask)
             
-            if mask_path is not None:
-                custom_mask = imageio.imread(mask_path)
-                # Handle different mask formats (grayscale or RGB)
-                if len(custom_mask.shape) == 3:
-                    custom_mask = custom_mask[..., 0]  # Take first channel
-                # Resize mask if needed to match image size
-                if custom_mask.shape[:2] != image.shape[:2]:
-                    print(f"[Mask] Resizing mask from {custom_mask.shape[:2]} to {image.shape[:2]}")
-                    custom_mask = np.array(
-                        Image.fromarray(custom_mask).resize(
-                            (image.shape[1], image.shape[0]), Image.NEAREST
-                        )
-                    )
-                # Convert to boolean: nonzero = valid region
-                custom_mask = custom_mask > 0
-                # Debug: print mask stats for first few images
-                if item < 3 or (item % 500 == 0):
-                    valid_pct = 100 * custom_mask.sum() / custom_mask.size
-                    print(f"[Mask] {image_name}: {custom_mask.sum()}/{custom_mask.size} valid pixels ({valid_pct:.1f}%)")
-                # Combine with existing mask (e.g., from undistortion)
-                if mask is not None:
-                    mask = mask & custom_mask
-                else:
-                    mask = custom_mask
-            else:
-                if item < 3:
-                    print(f"[Mask] Warning: No mask found for {image_name} at {candidate}")
+        if self.weak_mask_dir is not None:
+            weak_mask = self.load_custom_mask(self.weak_mask_dir, item,  index, image, weak_mask)
         
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
@@ -499,6 +485,44 @@ class Dataset:
             data["depths"] = torch.from_numpy(depths).float()
 
         return data
+
+    def load_custom_mask(self, mask_dir: str, item: int, index, image, mask):
+        image_name = self.parser.image_names[index]
+            # Try common mask file extensions
+        mask_name_base = os.path.splitext(image_name)[0]
+        mask_path = None
+        candidate = os.path.join(mask_dir, str(mask_name_base) + ".jpg.png")
+        if os.path.exists(candidate):
+            mask_path = candidate
+            
+        if mask_path is not None:
+            custom_mask = imageio.imread(mask_path)
+                # Handle different mask formats (grayscale or RGB)
+            if len(custom_mask.shape) == 3:
+                custom_mask = custom_mask[..., 0]  # Take first channel
+                # Resize mask if needed to match image size
+            if custom_mask.shape[:2] != image.shape[:2]:
+                print(f"[Mask] Resizing mask from {custom_mask.shape[:2]} to {image.shape[:2]}")
+                custom_mask = np.array(
+                        Image.fromarray(custom_mask).resize(
+                            (image.shape[1], image.shape[0]), Image.NEAREST
+                        )
+                    )
+                # Convert to boolean: nonzero = valid region
+            custom_mask = custom_mask > 0
+                # Debug: print mask stats for first few images
+            if item < 3 or (item % 500 == 0):
+                valid_pct = 100 * custom_mask.sum() / custom_mask.size
+                print(f"[Mask] {image_name}: {custom_mask.sum()}/{custom_mask.size} valid pixels ({valid_pct:.1f}%)")
+                # Combine with existing mask (e.g., from undistortion)
+            if mask is not None:
+                mask = mask & custom_mask
+            else:
+                mask = custom_mask
+        else:
+            if item < 3:
+                print(f"[Mask] Warning: No mask found for {image_name} at {candidate}")
+        return mask
 
 
 if __name__ == "__main__":
