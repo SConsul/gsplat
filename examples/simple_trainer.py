@@ -438,10 +438,10 @@ class Runner:
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
-            mask_dir=cfg.mask_dir,
-            weak_mask_dir=cfg.weak_mask_dir,
+            rgb_mask_dir=cfg.mask_dir,
+            weak_depth_mask_dir=cfg.weak_mask_dir,
         )
-        self.valset = Dataset(self.parser, split="val", mask_dir=cfg.mask_dir, weak_mask_dir=None)
+        self.valset = Dataset(self.parser, split="val", rgb_mask_dir=cfg.mask_dir, weak_depth_mask_dir=None)
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -810,8 +810,9 @@ class Runner:
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
             image_ids = data["image_id"].to(device)
-            masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
-            weak_mask = data["weak_mask"].to(device) if "weak_mask" in data else None  # [1, H, W]
+            rgb_mask = data["rgb_mask"].to(device) if "mask" in data else None  # [1, H, W]
+            depth_mask = data["depth_mask"].to(device) if "depth_mask" in data else None  # [1, H, W]
+            weak_depth_mask = data["weak_depth_mask"].to(device) if "weak_depth_mask" in data else None  # [1, H, W]
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
@@ -838,7 +839,7 @@ class Runner:
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
-                masks=masks,
+                masks=rgb_mask,
             )
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
@@ -872,10 +873,10 @@ class Runner:
             )
 
             # loss
-            if masks is not None:
+            if rgb_mask is not None:
                 # Apply mask: only compute loss on valid regions (mask=True)
                 # Expand mask to match color channels [B, H, W] -> [B, H, W, 3]
-                mask_expanded = masks.unsqueeze(-1).expand_as(colors)
+                mask_expanded = rgb_mask.unsqueeze(-1).expand_as(colors)
 
                 # L1 loss: only on valid pixels
                 l1loss = ((colors - pixels).abs()[mask_expanded].mean() if mask_expanded.any() else (colors - pixels).abs().sum() * 0.0)
@@ -885,7 +886,7 @@ class Runner:
                 ssimloss = masked_ssim(
                     colors.permute(0, 3, 1, 2),  # [B, C, H, W]
                     pixels.permute(0, 3, 1, 2),  # [B, C, H, W]
-                    masks,  # [B, H, W]
+                    rgb_mask,  # [B, H, W]
                 )
             else:
                 l1loss = F.l1_loss(colors, pixels)
@@ -910,9 +911,15 @@ class Runner:
                 )  # [1, 1, M, 1]
                 sampled_depths = sampled_depths.squeeze(3).squeeze(1)  # [1, M]
                 sampled_weights = None
-                if weak_mask is not None:
+                if weak_depth_mask is not None:
                     sampled_weights = F.grid_sample(
-                        weak_mask.permute(0, 3, 1, 2), grid, align_corners=True
+                        weak_depth_mask.permute(0, 3, 1, 2), grid, align_corners=True
+                    ).squeeze(3).squeeze(1)  # [1, M]
+                
+                sampled_mask = None
+                if depth_mask is not None:
+                    sampled_mask = F.grid_sample(
+                        depth_mask.permute(0, 3, 1, 2), grid, align_corners=True
                     ).squeeze(3).squeeze(1)  # [1, M]
                 # calculate loss in disparity space
                 disp = torch.where(sampled_depths > 0.0, 1.0 / sampled_depths, torch.zeros_like(sampled_depths))
@@ -920,9 +927,15 @@ class Runner:
                 
                 # weighted L1 loss
                 depth_diff = (disp - disp_gt).abs()
-                if weak_mask is not None:
-                    depth_diff = depth_diff * weak_mask 
-                depthloss = depth_diff.mean() * self.scene_scale
+                depth_den = torch.ones_like(depth_diff)
+                if sampled_weights is not None:
+                    weight = sampled_weights + cfg.weak_depth_loss_multiplier * (1.0 - sampled_weights)
+                    depth_diff *= weight
+                    depth_den *= weight 
+                if sampled_mask is not None:
+                    depth_diff *= sampled_mask
+                    depth_den *= sampled_mask
+                depthloss = (depth_diff.sum() / depth_den.sum().min(1e-4)) * self.scene_scale
 
                 loss += depthloss * cfg.depth_lambda
 

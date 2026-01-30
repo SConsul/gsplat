@@ -87,8 +87,9 @@ class Parser:
         Ks_dict = dict()
         params_dict = dict()
         imsize_dict = dict()  # width, height
-        mask_dict = dict()
-        weak_mask_dict = dict()
+        rgb_mask_dict = dict()
+        depth_mask_dict = dict()
+        weak_depth_mask_dict = dict()
         bottom = np.array([0, 0, 0, 1]).reshape(1, 4)
         for k in imdata:
             im = imdata[k]
@@ -134,8 +135,9 @@ class Parser:
 
             params_dict[camera_id] = params
             imsize_dict[camera_id] = (cam.width // factor, cam.height // factor)
-            mask_dict[camera_id] = None
-            weak_mask_dict[camera_id] = None
+            rgb_mask_dict[camera_id] = None
+            depth_mask_dict[camera_id] = None
+            weak_depth_mask_dict[camera_id] = None
         print(
             f"[Parser] {len(imdata)} images, taken by {len(set(camera_ids))} cameras."
         )
@@ -270,8 +272,9 @@ class Parser:
         self.Ks_dict = Ks_dict  # Dict of camera_id -> K
         self.params_dict = params_dict  # Dict of camera_id -> params
         self.imsize_dict = imsize_dict  # Dict of camera_id -> (width, height)
-        self.mask_dict = mask_dict  # Dict of camera_id -> mask
-        self.weak_mask_dict = weak_mask_dict  # Dict of camera_id -> mask
+        self.rgb_mask_dict = rgb_mask_dict  # Dict of camera_id -> mask
+        self.depth_mask_dict = depth_mask_dict # Dict of camera_id -> mask
+        self.weak_depth_mask_dict = weak_depth_mask_dict  # Dict of camera_id -> mask
         self.points = points  # np.ndarray, (num_points, 3)
         self.points_err = points_err  # np.ndarray, (num_points,)
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
@@ -313,8 +316,9 @@ class Parser:
                 mapx, mapy = cv2.initUndistortRectifyMap(
                     K, params, None, K_undist, (width, height), cv2.CV_32FC1
                 )
-                mask = None
-                weak_mask = None
+                rgb_mask = None
+                depth_mask = None
+                weak_depth_mask = None
             elif camtype == "fisheye":
                 fx = K[0, 0]
                 fy = K[1, 1]
@@ -339,15 +343,16 @@ class Parser:
                 mapy = (fy * y1 * r + height // 2).astype(np.float32)
 
                 # Use mask to define ROI
-                mask = np.logical_and(
+                rgb_mask = np.logical_and(
                     np.logical_and(mapx > 0, mapy > 0),
                     np.logical_and(mapx < width - 1, mapy < height - 1),
                 )
-                y_indices, x_indices = np.nonzero(mask)
+                y_indices, x_indices = np.nonzero(rgb_mask)
                 y_min, y_max = y_indices.min(), y_indices.max() + 1
                 x_min, x_max = x_indices.min(), x_indices.max() + 1
-                mask = mask[y_min:y_max, x_min:x_max]
-                weak_mask = None
+                rgb_mask = rgb_mask[y_min:y_max, x_min:x_max]
+                depth_mask = None
+                weak_depth_mask = None
                 K_undist = K.copy()
                 K_undist[0, 2] -= x_min
                 K_undist[1, 2] -= y_min
@@ -360,8 +365,9 @@ class Parser:
             self.Ks_dict[camera_id] = K_undist
             self.roi_undist_dict[camera_id] = roi_undist
             self.imsize_dict[camera_id] = (roi_undist[2], roi_undist[3])
-            self.mask_dict[camera_id] = mask
-            self.weak_mask_dict[camera_id] = weak_mask
+            self.rgb_mask_dict[camera_id] = rgb_mask
+            self.depth_mask_dict[camera_id] = depth_mask
+            self.weak_depth_mask_dict[camera_id] = weak_depth_mask
 
         # size of the scene measured by cameras
         camera_locations = camtoworlds[:, :3, 3]
@@ -379,8 +385,9 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
-        mask_dir: str | None = None,
-        weak_mask_dir: str | None = None,
+        rgb_mask_dir: str | None = None,
+        depth_mask_dir: str | None = None,
+        weak_depth_mask_dir: str | None = None,
     ):
         self.parser = parser
         self.split = split
@@ -394,23 +401,32 @@ class Dataset:
             self.indices = indices[indices % self.parser.test_every == 0]
         
         # Check for masks directory
-        self.mask_dir = None
-        if mask_dir is not None:
-            full_mask_dir = os.path.join(parser.data_dir, mask_dir)
+        self.rgb_mask_dir = None
+        if rgb_mask_dir is not None:
+            full_mask_dir = os.path.join(parser.data_dir, rgb_mask_dir)
             if os.path.exists(full_mask_dir):
-                self.mask_dir = full_mask_dir
+                self.rgb_mask_dir = full_mask_dir
                 print(f"[Dataset] Loading ignore masks from {full_mask_dir}")
             else:
-                print(f"[Dataset] Warning: mask_dir={mask_dir} but {full_mask_dir} does not exist")
+                print(f"[Dataset] Warning: rgb_mask_dir={rgb_mask_dir} but {full_mask_dir} does not exist")
                 
-        self.weak_mask_dir = None
-        if weak_mask_dir is not None:
-            full_mask_dir = os.path.join(parser.data_dir, weak_mask_dir)
+        self.weak_depth_mask_dir = None
+        if weak_depth_mask_dir is not None:
+            full_mask_dir = os.path.join(parser.data_dir, weak_depth_mask_dir)
             if os.path.exists(full_mask_dir):
-                self.weak_mask_dir = full_mask_dir
+                self.weak_depth_mask_dir = full_mask_dir
                 print(f"[Dataset] Loading ignore masks from {full_mask_dir}")
             else:
-                print(f"[Dataset] Warning: weak_mask_dir={weak_mask_dir} but {full_mask_dir} does not exist")
+                print(f"[Dataset] Warning: weak_depth_mask_dir={weak_depth_mask_dir} but {full_mask_dir} does not exist")
+                
+        self.depth_mask_dir = None
+        if depth_mask_dir is not None:
+            full_mask_dir = os.path.join(parser.data_dir, depth_mask_dir)
+            if os.path.exists(full_mask_dir):
+                self.depth_mask_dir = full_mask_dir
+                print(f"[Dataset] Loading ignore masks from {full_mask_dir}")
+            else:
+                print(f"[Dataset] Warning: depth_mask_dir={depth_mask_dir} but {full_mask_dir} does not exist")
 
     def __len__(self):
         return len(self.indices)
@@ -422,8 +438,9 @@ class Dataset:
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
-        mask = self.parser.mask_dict[camera_id]
-        weak_mask = self.parser.weak_mask_dict[camera_id]
+        rgb_mask = self.parser.rgb_mask_dict[camera_id]
+        
+        weak_depth_mask = self.parser.weak_depth_mask_dict[camera_id]
 
         if len(params) > 0:
             # Images are distorted. Undistort them.
@@ -452,14 +469,21 @@ class Dataset:
         }
         
         # Load custom mask from masks folder if available
-        if self.mask_dir is not None:
-            mask = self.load_custom_mask(self.mask_dir, item, index, image, mask)
+        if self.rgb_mask_dir is not None:
+            rgb_mask = self.load_custom_mask(self.rgb_mask_dir, item, index, image, rgb_mask)
             
-        if self.weak_mask_dir is not None:
-            weak_mask = self.load_custom_mask(self.weak_mask_dir, item,  index, image, weak_mask)
+        if self.weak_depth_mask_dir is not None:
+            weak_depth_mask = self.load_custom_mask(self.weak_depth_mask_dir, item,  index, image, weak_depth_mask)
+            
+        if self.depth_mask_dir is not None:
+            depth_mask = self.load_custom_mask(self.depth_mask_dir, item,  index, image, depth_mask)
         
-        if mask is not None:
-            data["mask"] = torch.from_numpy(mask).bool()
+        if rgb_mask is not None:
+            data["rgb_mask"] = torch.from_numpy(rgb_mask).bool()
+        if weak_depth_mask is not None:
+            data["weak_depth_mask"] = torch.from_numpy(weak_depth_mask).bool()
+        if depth_mask is not None:
+            data["depth_mask"] = torch.from_numpy(depth_mask).bool()
 
         if self.load_depths:
             # projected points to image plane to get depths
@@ -486,7 +510,7 @@ class Dataset:
 
         return data
 
-    def load_custom_mask(self, mask_dir: str, item: int, index, image, mask):
+    def load_custom_mask(self, mask_dir: str, item: int, index: int, image, mask):
         image_name = self.parser.image_names[index]
             # Try common mask file extensions
         mask_name_base = os.path.splitext(image_name)[0]
