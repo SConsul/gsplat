@@ -155,6 +155,9 @@ class MCMCStrategy(Strategy):
         dead_mask = opacities <= self.min_opacity
         n_gs = dead_mask.sum().item()
         if n_gs > 0:
+            print("opacities has NaN:", params["opacities"].isnan().any())                                                                                             
+            print("opacities min/max:", params["opacities"].min(), params["opacities"].max())
+            breakpoint()                                                                          
             relocate(
                 params=params,
                 optimizers=optimizers,

@@ -262,10 +262,12 @@ class Config:
     depth_lambda: float = 1e-2
 
     # where to load masks from folder to ignore regions during training
-    mask_dir: str | None = None
+    rgb_mask_dir: str | None = None
+
+    depth_mask_dir: str | None = None
     
     # where to load masks from folder to reduce depth supervision during training
-    weak_mask_dir: str | None = None
+    weak_depth_mask_dir: str | None = None
     
     weak_depth_loss_multiplier: float = 0.3
 
@@ -438,10 +440,11 @@ class Runner:
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
-            rgb_mask_dir=cfg.mask_dir,
-            weak_depth_mask_dir=cfg.weak_mask_dir,
+            rgb_mask_dir=cfg.rgb_mask_dir,
+            weak_depth_mask_dir=cfg.weak_depth_mask_dir,
+            depth_mask_dir=cfg.depth_mask_dir,
         )
-        self.valset = Dataset(self.parser, split="val", rgb_mask_dir=cfg.mask_dir, weak_depth_mask_dir=None)
+        self.valset = Dataset(self.parser, split="val", rgb_mask_dir=cfg.rgb_mask_dir, weak_depth_mask_dir=None)
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -810,7 +813,7 @@ class Runner:
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
             image_ids = data["image_id"].to(device)
-            rgb_mask = data["rgb_mask"].to(device) if "mask" in data else None  # [1, H, W]
+            rgb_mask = data["rgb_mask"].to(device) if "rgb_mask" in data else None  # [1, H, W]
             depth_mask = data["depth_mask"].to(device) if "depth_mask" in data else None  # [1, H, W]
             weak_depth_mask = data["weak_depth_mask"].to(device) if "weak_depth_mask" in data else None  # [1, H, W]
             if cfg.depth_loss:
@@ -913,14 +916,14 @@ class Runner:
                 sampled_weights = None
                 if weak_depth_mask is not None:
                     sampled_weights = F.grid_sample(
-                        weak_depth_mask.permute(0, 3, 1, 2), grid, align_corners=True
-                    ).squeeze(3).squeeze(1)  # [1, M]
+                        weak_depth_mask.unsqueeze(0).float(), grid, align_corners=True
+                    ).squeeze(3).squeeze(1)  > 0.5 # [1, M]
                 
                 sampled_mask = None
                 if depth_mask is not None:
                     sampled_mask = F.grid_sample(
-                        depth_mask.permute(0, 3, 1, 2), grid, align_corners=True
-                    ).squeeze(3).squeeze(1)  # [1, M]
+                        depth_mask.unsqueeze(0).float(), grid, align_corners=True
+                    ).squeeze(3).squeeze(1) > 0.5 # [1, M]
                 # calculate loss in disparity space
                 disp = torch.where(sampled_depths > 0.0, 1.0 / sampled_depths, torch.zeros_like(sampled_depths))
                 disp_gt = 1.0 / depths_gt  # [1, M]
@@ -929,13 +932,13 @@ class Runner:
                 depth_diff = (disp - disp_gt).abs()
                 depth_den = torch.ones_like(depth_diff)
                 if sampled_weights is not None:
-                    weight = sampled_weights + cfg.weak_depth_loss_multiplier * (1.0 - sampled_weights)
+                    weight = sampled_weights.float() + cfg.weak_depth_loss_multiplier * (1.0 - sampled_weights.float())
                     depth_diff *= weight
                     depth_den *= weight 
                 if sampled_mask is not None:
                     depth_diff *= sampled_mask
                     depth_den *= sampled_mask
-                depthloss = (depth_diff.sum() / depth_den.sum().min(1e-4)) * self.scene_scale
+                depthloss = (depth_diff.sum() / depth_den.sum().clamp(min=1e-4)) * self.scene_scale
 
                 loss += depthloss * cfg.depth_lambda
 
@@ -949,6 +952,13 @@ class Runner:
             if cfg.scale_reg > 0.0:
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
+            # Penalize opacity in masked regions to prevent floaters
+            if rgb_mask is not None:
+                masked_alpha = alphas.squeeze(-1)[~rgb_mask]
+                if masked_alpha.numel() > 0:
+                    loss += 0.4 * masked_alpha.mean()
+                    if step % 500 == 0:
+                        print(f"Step {step}: masked alpha mean={masked_alpha.mean():.4f}, max={masked_alpha.max():.4f}")
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "

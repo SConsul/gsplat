@@ -29,6 +29,10 @@ def _multinomial_sample(weights: Tensor, n: int, replacement: bool = True) -> Te
     num_elements = weights.size(0)
 
     if num_elements <= 2**24:
+        print("Has NaN:", weights.isnan().any())                                                                                                                     
+        print("Has Inf:", weights.isinf().any())                                                                                                                     
+        print("Has negative:", (weights < 0).any())                                                                                                                  
+        print("Zero-sum rows:", (weights.sum(dim=-1) == 0).any())    
         # Use torch.multinomial for elements within the limit
         return torch.multinomial(weights, n, replacement=replacement)
     else:

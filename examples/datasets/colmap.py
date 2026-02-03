@@ -386,8 +386,8 @@ class Dataset:
         patch_size: Optional[int] = None,
         load_depths: bool = False,
         rgb_mask_dir: str | None = None,
-        depth_mask_dir: str | None = None,
         weak_depth_mask_dir: str | None = None,
+        depth_mask_dir: str | None = None,
     ):
         self.parser = parser
         self.split = split
@@ -438,8 +438,9 @@ class Dataset:
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
-        rgb_mask = self.parser.rgb_mask_dict[camera_id]
         
+        rgb_mask = self.parser.rgb_mask_dict[camera_id]
+        depth_mask = self.parser.depth_mask_dict[camera_id]
         weak_depth_mask = self.parser.weak_depth_mask_dict[camera_id]
 
         if len(params) > 0:
@@ -514,6 +515,7 @@ class Dataset:
         image_name = self.parser.image_names[index]
             # Try common mask file extensions
         mask_name_base = os.path.splitext(image_name)[0]
+        mask_name = mask_dir.split("/")[-1]
         mask_path = None
         candidate = os.path.join(mask_dir, str(mask_name_base) + ".jpg.png")
         if os.path.exists(candidate):
@@ -526,7 +528,7 @@ class Dataset:
                 custom_mask = custom_mask[..., 0]  # Take first channel
                 # Resize mask if needed to match image size
             if custom_mask.shape[:2] != image.shape[:2]:
-                print(f"[Mask] Resizing mask from {custom_mask.shape[:2]} to {image.shape[:2]}")
+                print(f"[Mask ({mask_name})] Resizing mask from {custom_mask.shape[:2]} to {image.shape[:2]}")
                 custom_mask = np.array(
                         Image.fromarray(custom_mask).resize(
                             (image.shape[1], image.shape[0]), Image.NEAREST
@@ -537,7 +539,7 @@ class Dataset:
                 # Debug: print mask stats for first few images
             if item < 3 or (item % 500 == 0):
                 valid_pct = 100 * custom_mask.sum() / custom_mask.size
-                print(f"[Mask] {image_name}: {custom_mask.sum()}/{custom_mask.size} valid pixels ({valid_pct:.1f}%)")
+                print(f"[Mask ({mask_name})] {image_name}: {custom_mask.sum()}/{custom_mask.size} valid pixels ({valid_pct:.1f}%)")
                 # Combine with existing mask (e.g., from undistortion)
             if mask is not None:
                 mask = mask & custom_mask
@@ -545,7 +547,7 @@ class Dataset:
                 mask = custom_mask
         else:
             if item < 3:
-                print(f"[Mask] Warning: No mask found for {image_name} at {candidate}")
+                print(f"[Mask({mask_name})] Warning: No mask found for {image_name} at {candidate}")
         return mask
 
 
