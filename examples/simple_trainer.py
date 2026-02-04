@@ -790,10 +790,22 @@ class Runner:
                     depths.permute(0, 3, 1, 2), grid, align_corners=True
                 )  # [1, 1, M, 1]
                 depths = depths.squeeze(3).squeeze(1)  # [1, M]
+
+                sampled_mask = None
+                if rgb_mask is not None:
+                    sampled_mask = F.grid_sample(
+                        rgb_mask.unsqueeze(0).float(), grid, align_corners=True
+                    ).squeeze(3).squeeze(1) > 0.5 # [1, M]
                 # calculate loss in disparity space
                 disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
                 disp_gt = 1.0 / depths_gt  # [1, M]
-                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                # weighted L1 loss
+                depth_diff = (disp - disp_gt).abs()
+                depth_den = torch.ones_like(depth_diff)
+                if sampled_mask is not None:
+                    depth_diff *= sampled_mask
+                    depth_den *= sampled_mask
+                depthloss = (depth_diff.sum() / depth_den.sum().clamp(min=1e-4)) * self.scene_scale
                 loss += depthloss * depth_lambda
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
