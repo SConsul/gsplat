@@ -235,6 +235,9 @@ class Config:
     
     # where to load masks from folder to ignore regions during training
     rgb_mask_dir: str | None = None
+    
+    # where to load masks from folder to ignore depth during training
+    depth_mask_dir: str | None = None
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
@@ -407,6 +410,7 @@ class Runner:
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
             rgb_mask_dir=cfg.rgb_mask_dir,
+            depth_mask_dir=cfg.depth_mask_dir,
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
@@ -682,6 +686,7 @@ class Runner:
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
             rgb_mask = data["rgb_mask"].to(device) if "rgb_mask" in data else None  # [1, H, W]
+            depth_mask = data["depth_mask"].to(device) if "depth_mask" in data else None  # [1, H, W]
             
             # if data_factor > 1.0:
             #     Ks = Ks.clone()
@@ -792,9 +797,14 @@ class Runner:
                 depths = depths.squeeze(3).squeeze(1)  # [1, M]
 
                 sampled_mask = None
+                mask = depth_mask
                 if rgb_mask is not None:
+                    if mask is not None:
+                        mask = mask & rgb_mask
+                    else:
+                        mask = rgb_mask
                     sampled_mask = F.grid_sample(
-                        rgb_mask.unsqueeze(0).float(), grid, align_corners=True
+                        mask.unsqueeze(0).float(), grid, align_corners=True
                     ).squeeze(3).squeeze(1) > 0.5 # [1, M]
                 # calculate loss in disparity space
                 disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))

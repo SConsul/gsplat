@@ -89,6 +89,7 @@ class Parser:
         params_dict = dict()
         imsize_dict = dict()  # width, height
         rgb_mask_dict = dict()
+        depth_mask_dict = dict()
         bottom = np.array([0, 0, 0, 1]).reshape(1, 4)
         for k in imdata:
             im = imdata[k]
@@ -135,6 +136,7 @@ class Parser:
             params_dict[camera_id] = params
             imsize_dict[camera_id] = (cam.width // factor, cam.height // factor)
             rgb_mask_dict[camera_id] = None
+            depth_mask_dict[camera_id] = None
         print(
             f"[Parser] {len(imdata)} images, taken by {len(set(camera_ids))} cameras."
         )
@@ -254,6 +256,7 @@ class Parser:
         self.params_dict = params_dict  # Dict of camera_id -> params
         self.imsize_dict = imsize_dict  # Dict of camera_id -> (width, height)
         self.rgb_mask_dict = rgb_mask_dict  # Dict of camera_id -> mask
+        self.depth_mask_dict = depth_mask_dict  # Dict of camera_id -> mask
         self.points = points  # np.ndarray, (num_points, 3)
         self.points_err = points_err  # np.ndarray, (num_points,)
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
@@ -341,6 +344,7 @@ class Parser:
             self.roi_undist_dict[camera_id] = roi_undist
             self.imsize_dict[camera_id] = (roi_undist[2], roi_undist[3])
             self.rgb_mask_dict[camera_id] = mask
+            self.depth_mask_dict[camera_id] = mask.clone() if mask is not None else None
 
         # size of the scene measured by cameras
         camera_locations = camtoworlds[:, :3, 3]
@@ -358,7 +362,8 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
-        rgb_mask_dir: str | None = None
+        rgb_mask_dir: str | None = None,
+        depth_mask_dir: str | None = None,
     ):
         self.parser = parser
         self.split = split
@@ -378,6 +383,15 @@ class Dataset:
                 print(f"[Dataset] Loading ignore masks from {full_mask_dir}")
             else:
                 print(f"[Dataset] Warning: rgb_mask_dir={rgb_mask_dir} but {full_mask_dir} does not exist")
+                
+        self.depth_mask_dir = None
+        if depth_mask_dir is not None:
+            full_mask_dir = os.path.join(parser.data_dir, depth_mask_dir)
+            if os.path.exists(full_mask_dir):
+                self.depth_mask_dir = full_mask_dir
+                print(f"[Dataset] Loading ignore masks from {full_mask_dir}")
+            else:
+                print(f"[Dataset] Warning: depth_mask_dir={depth_mask_dir} but {full_mask_dir} does not exist")
 
     def __len__(self):
         return len(self.indices)
@@ -390,6 +404,7 @@ class Dataset:
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
         rgb_mask = self.parser.rgb_mask_dict[camera_id]
+        depth_mask = self.parser.depth_mask_dict[camera_id]
 
         if len(params) > 0:
             # Images are distorted. Undistort them.
@@ -420,10 +435,16 @@ class Dataset:
         rgb_mask = None
         if self.rgb_mask_dir is not None:
             rgb_mask = self.load_custom_mask(self.rgb_mask_dir, item, index, image, rgb_mask)
-        
+            
+        depth_mask = None
+        if self.depth_mask_dir is not None:
+            depth_mask = self.load_custom_mask(self.depth_mask_dir, item, index, image, depth_mask)
+
         if rgb_mask is not None:
             data["rgb_mask"] = rgb_mask
-
+        if depth_mask is not None:
+            data["depth_mask"] = depth_mask
+             
         if self.load_depths:
             # projected points to image plane to get depths
             worldtocams = np.linalg.inv(camtoworlds)
