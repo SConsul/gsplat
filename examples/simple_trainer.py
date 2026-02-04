@@ -39,7 +39,67 @@ from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
+def scheduled_hypers(iteration: int, cfg_depth_lambda: float):
+    # Keep low res longer since floor needs geometric stability
+    if iteration < 5000:
+        data_factor = 4
+        depth_lambda = 0.2
+    elif iteration < 12000:
+        data_factor = 2
+        depth_lambda = 0.15
+    elif iteration < 20000:
+        data_factor = 1.33
+        depth_lambda = 0.1
+    else:
+        data_factor = 1.0
+        depth_lambda = 0.05
+    return data_factor, depth_lambda
 
+def resize_images(images, target_height, target_width):
+    """
+    Resize images from (B, H, W, C) to (B, target_height, target_width, C)
+    
+    Args:
+        images: torch.Tensor of shape (B, H, W, C)
+        target_height: int
+        target_width: int
+    
+    Returns:
+        resized images of shape (B, target_height, target_width, C)
+    """
+    # F.interpolate expects (B, C, H, W), so permute
+    images_bchw = images.permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
+
+    # Resize
+    resized_bchw = F.interpolate(
+        images_bchw,
+        size=(target_height, target_width),
+        mode='bilinear',  # or 'bicubic' for higher quality
+        align_corners=False
+    )
+
+    # Permute back to (B, H, W, C)
+    resized_images = resized_bchw.permute(0, 2, 3, 1)  # (B, C, H, W) -> (B, H, W, C)
+    
+    return resized_images
+
+def resize(img: torch.Tensor, factor: int=1):
+    """
+    reszie img of shape: B, H, W, C by factor
+    
+    :param img: Description
+    :type img: torch.Tensor
+    :param factor: Description
+    :type factor: int
+    """
+    
+    if factor <=1:
+        return img
+    _, H, W, C = img.shape
+    target_height = int(H // factor)
+    target_width = int(W // factor)
+    return resize_images(img, target_height, target_width)
+    
 @dataclass
 class Config:
     # Disable viewer
@@ -613,17 +673,28 @@ class Runner:
                 trainloader_iter = iter(trainloader)
                 data = next(trainloader_iter)
 
+            data_factor, depth_lambda = scheduled_hypers(step, cfg.depth_lambda)
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+            masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            
+            if data_factor > 1.0:
+                Ks = Ks.clone()
+                Ks[:, :2, :] = Ks[:, :2, :] / data_factor
+                pixels = resize(pixels, data_factor)
+                if masks is not None:
+                    masks = resize(masks.unsqueeze(-1), data_factor).squeeze(-1)
+            
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
             image_ids = data["image_id"].to(device)
-            masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
+                # ignore scaling points and depth_gt both
 
             height, width = pixels.shape[1:3]
 
@@ -679,7 +750,6 @@ class Runner:
                 step=step,
                 info=info,
             )
-
             # loss
             l1loss = F.l1_loss(colors, pixels)
             ssimloss = 1.0 - fused_ssim(
@@ -704,7 +774,7 @@ class Runner:
                 disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
-                loss += depthloss * cfg.depth_lambda
+                loss += depthloss * depth_lambda
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
