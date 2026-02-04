@@ -6,6 +6,7 @@ import cv2
 import imageio.v2 as imageio
 import numpy as np
 import torch
+import numpy.typing as npt
 from PIL import Image
 from pycolmap import SceneManager
 from tqdm import tqdm
@@ -363,12 +364,20 @@ class Dataset:
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
-        self.rgb_mask_dir = rgb_mask_dir
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
         else:
             self.indices = indices[indices % self.parser.test_every == 0]
+        
+        self.rgb_mask_dir = None
+        if rgb_mask_dir is not None:
+            full_mask_dir = os.path.join(parser.data_dir, rgb_mask_dir)
+            if os.path.exists(full_mask_dir):
+                self.rgb_mask_dir = full_mask_dir
+                print(f"[Dataset] Loading ignore masks from {full_mask_dir}")
+            else:
+                print(f"[Dataset] Warning: rgb_mask_dir={rgb_mask_dir} but {full_mask_dir} does not exist")
 
     def __len__(self):
         return len(self.indices)
@@ -407,8 +416,13 @@ class Dataset:
             "image": torch.from_numpy(image).float(),
             "image_id": item,  # the index of the image in the dataset
         }
+        
+        rgb_mask = None
+        if self.rgb_mask_dir is not None:
+            rgb_mask = self.load_custom_mask(self.rgb_mask_dir, item, index, image, rgb_mask)
+        
         if rgb_mask is not None:
-            data["rgb_mask"] = torch.from_numpy(rgb_mask).bool()
+            data["rgb_mask"] = rgb_mask
 
         if self.load_depths:
             # projected points to image plane to get depths
@@ -434,6 +448,45 @@ class Dataset:
             data["depths"] = torch.from_numpy(depths).float()
 
         return data
+    
+    def load_custom_mask(self, mask_dir: str, item: int, index: int, image, mask: npt.NDArray[np.bool_]|None) -> torch.Tensor:
+        image_name = self.parser.image_names[index]
+            # Try common mask file extensions
+        mask_name_base = os.path.splitext(image_name)[0]
+        mask_name = mask_dir.split("/")[-1]
+        mask_path = None
+        candidate = os.path.join(mask_dir, str(mask_name_base) + ".jpg.png")
+        if os.path.exists(candidate):
+            mask_path = candidate
+            
+        if mask_path is not None:
+            custom_mask = imageio.imread(mask_path)
+                # Handle different mask formats (grayscale or RGB)
+            if len(custom_mask.shape) == 3:
+                custom_mask = custom_mask[..., 0]  # Take first channel
+                # Resize mask if needed to match image size
+            if custom_mask.shape[:2] != image.shape[:2]:
+                print(f"[Mask ({mask_name})] Resizing mask from {custom_mask.shape[:2]} to {image.shape[:2]}")
+                custom_mask = np.array(
+                        Image.fromarray(custom_mask).resize(
+                            (image.shape[1], image.shape[0]), Image.NEAREST
+                        )
+                    )
+                # Convert to boolean: nonzero = valid region
+            custom_mask = custom_mask > 0
+                # Debug: print mask stats for first few images
+            if item < 3 or (item % 500 == 0):
+                valid_pct = 100 * custom_mask.sum() / custom_mask.size
+                print(f"[Mask ({mask_name})] {image_name}: {custom_mask.sum()}/{custom_mask.size} valid pixels ({valid_pct:.1f}%)")
+                # Combine with existing mask (e.g., from undistortion)
+            if mask is not None:
+                mask = mask & custom_mask
+            else:
+                mask = custom_mask
+        else:
+            if item < 3:
+                print(f"[Mask({mask_name})] Warning: No mask found for {image_name} at {candidate}")
+        return torch.from_numpy(mask).bool()
 
 
 if __name__ == "__main__":

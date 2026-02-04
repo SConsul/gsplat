@@ -36,6 +36,7 @@ from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.strategy.ops import remove as remove_splats
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 from masked_ssim import masked_ssim
@@ -43,18 +44,14 @@ from masked_ssim import masked_ssim
 def scheduled_hypers(iteration: int, cfg_depth_lambda: float):
     # Keep low res longer since floor needs geometric stability
     if iteration < 5000:
-        data_factor = 4
-        depth_lambda = 0.2
+        depth_lambda = cfg_depth_lambda
     elif iteration < 12000:
-        data_factor = 2
-        depth_lambda = 0.15
+        depth_lambda = 1.5 * cfg_depth_lambda
     elif iteration < 20000:
-        data_factor = 1.33
-        depth_lambda = 0.1
+        depth_lambda = 2.0 * cfg_depth_lambda
     else:
-        data_factor = 1.0
-        depth_lambda = 0.05
-    return data_factor, depth_lambda
+        depth_lambda = 3.0 * cfg_depth_lambda
+    return depth_lambda
 
 def resize_images(images, target_height, target_width):
     """
@@ -205,6 +202,8 @@ class Config:
     opacity_reg: float = 0.0
     # Scale regularization
     scale_reg: float = 0.0
+    # # Max scale for pruning (0 = disabled). Splats with any scale > this are removed.
+    # max_scale: float = 0.0
 
     # Enable camera optimization.
     pose_opt: bool = False
@@ -233,6 +232,9 @@ class Config:
     depth_loss: bool = False
     # Weight for depth loss
     depth_lambda: float = 1e-2
+    
+    # where to load masks from folder to ignore regions during training
+    rgb_mask_dir: str | None = None
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
@@ -404,6 +406,7 @@ class Runner:
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
+            rgb_mask_dir=cfg.rgb_mask_dir,
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
@@ -674,18 +677,18 @@ class Runner:
                 trainloader_iter = iter(trainloader)
                 data = next(trainloader_iter)
 
-            data_factor, depth_lambda = scheduled_hypers(step, cfg.depth_lambda)
+            depth_lambda = scheduled_hypers(step, cfg.depth_lambda)
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
             rgb_mask = data["rgb_mask"].to(device) if "rgb_mask" in data else None  # [1, H, W]
             
-            if data_factor > 1.0:
-                Ks = Ks.clone()
-                Ks[:, :2, :] = Ks[:, :2, :] / data_factor
-                pixels = resize(pixels, data_factor)
-                if rgb_mask is not None:
-                    rgb_mask = resize(rgb_mask.unsqueeze(-1), data_factor).squeeze(-1)
+            # if data_factor > 1.0:
+            #     Ks = Ks.clone()
+            #     Ks[:, :2, :] = Ks[:, :2, :] / data_factor
+            #     pixels = resize(pixels, data_factor)
+            #     if rgb_mask is not None:
+            #         rgb_mask = resize(rgb_mask.unsqueeze(-1).float(), data_factor).squeeze(-1).bool()
             
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
@@ -967,6 +970,21 @@ class Runner:
                 )
             else:
                 assert_never(self.cfg.strategy)
+
+            # # Prune splats with large scales
+            # if cfg.max_scale > 0.0:
+            #     scales = torch.exp(self.splats["scales"])  # [N, 3]
+            #     large_scale_mask = (scales > cfg.max_scale).any(dim=-1)  # [N]
+            #     if large_scale_mask.any():
+            #         n_pruned = large_scale_mask.sum().item()
+            #         remove_splats(
+            #             params=self.splats,
+            #             optimizers=self.optimizers,
+            #             state=self.strategy_state,
+            #             mask=large_scale_mask,
+            #         )
+            #         if step % 1000 == 0:
+            #             print(f"Pruned {n_pruned} large splats (scale > {cfg.max_scale})")
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
