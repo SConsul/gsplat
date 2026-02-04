@@ -582,10 +582,10 @@ class Runner:
                 step=step,
                 info=info,
             )
-            masks = data["mask"].to(device) if "mask" in data else None
-            if masks is not None:
-                pixels = pixels * masks[..., None]
-                colors = colors * masks[..., None]
+            rgb_masks = data["rgb_mask"].to(device) if "rgb_mask" in data else None
+            if rgb_masks is not None:
+                pixels = pixels * rgb_masks[..., None]
+                colors = colors * rgb_masks[..., None]
 
             # loss
             l1loss = F.l1_loss(colors, pixels)

@@ -38,6 +38,7 @@ from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
+from masked_ssim import masked_ssim
 
 def scheduled_hypers(iteration: int, cfg_depth_lambda: float):
     # Keep low res longer since floor needs geometric stability
@@ -677,14 +678,14 @@ class Runner:
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
-            masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            rgb_mask = data["rgb_mask"].to(device) if "rgb_mask" in data else None  # [1, H, W]
             
             if data_factor > 1.0:
                 Ks = Ks.clone()
                 Ks[:, :2, :] = Ks[:, :2, :] / data_factor
                 pixels = resize(pixels, data_factor)
-                if masks is not None:
-                    masks = resize(masks.unsqueeze(-1), data_factor).squeeze(-1)
+                if rgb_mask is not None:
+                    rgb_mask = resize(rgb_mask.unsqueeze(-1), data_factor).squeeze(-1)
             
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
@@ -718,7 +719,7 @@ class Runner:
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
-                masks=masks,
+                masks=rgb_mask,
             )
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
@@ -750,11 +751,27 @@ class Runner:
                 step=step,
                 info=info,
             )
-            # loss
-            l1loss = F.l1_loss(colors, pixels)
-            ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-            )
+
+            if rgb_mask is not None:
+                # Apply mask: only compute loss on valid regions (mask=True)
+                # Expand mask to match color channels [B, H, W] -> [B, H, W, 3]
+                mask_expanded = rgb_mask.unsqueeze(-1).expand_as(colors)
+
+                # L1 loss: only on valid pixels
+                l1loss = ((colors - pixels).abs()[mask_expanded].mean() if mask_expanded.any() else (colors - pixels).abs().sum() * 0.0)
+
+                # SSIM loss: Use proper masked SSIM that excludes invalid pixels from
+                # window statistics and only averages over valid regions
+                ssimloss = masked_ssim(
+                    colors.permute(0, 3, 1, 2),  # [B, C, H, W]
+                    pixels.permute(0, 3, 1, 2),  # [B, C, H, W]
+                    rgb_mask,  # [B, H, W]
+                )
+            else:
+                l1loss = F.l1_loss(colors, pixels)
+                ssimloss = 1.0 - fused_ssim(
+                    colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             if cfg.depth_loss:
                 # query depths from depth map
@@ -991,7 +1008,7 @@ class Runner:
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
             pixels = data["image"].to(device) / 255.0
-            masks = data["mask"].to(device) if "mask" in data else None
+            rgb_mask = data["rgb_mask"].to(device) if "rgb_mask" in data else None
             height, width = pixels.shape[1:3]
 
             torch.cuda.synchronize()
@@ -1004,7 +1021,7 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
-                masks=masks,
+                masks=rgb_mask,
             )  # [1, H, W, 3]
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
