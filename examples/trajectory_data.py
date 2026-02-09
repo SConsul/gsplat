@@ -246,6 +246,49 @@ class TrajectoryData:
 
         return new_traj
 
+    def fix_left_right_flip(self):
+        """
+        Fix left-right flip in trajectories generated with incorrect right vector computation.
+
+        This corrects trajectories that were generated before the fix to generate_trajectory.py
+        (lines 137, 262, 412) where the right vector was computed as [forward[1], -forward[0], 0]
+        instead of the correct [-forward[1], forward[0], 0].
+
+        The fix negates the first column of each camera's rotation matrix, which flips the
+        camera's X-axis direction (left <-> right) while preserving Y and Z axes.
+
+        Returns:
+            Modified TrajectoryData instance for method chaining
+
+        Note:
+            This function should only be applied to trajectories that exhibit left-right flip.
+            Applying it twice will cancel out the correction.
+        """
+        # Create a deep copy to avoid modifying the original
+        new_traj = copy.deepcopy(self)
+
+        # Fix each camera's rotation matrix
+        for i in range(len(new_traj.camtoworlds)):
+            # Extract rotation matrix (top-left 3x3)
+            R = new_traj.camtoworlds[i, :3, :3].copy()
+
+            # Negate the first column (camera's X-axis / right direction)
+            # This flips left <-> right in the rendered view
+            R[:, 0] = -R[:, 0]
+
+            # Update the rotation matrix
+            new_traj.camtoworlds[i, :3, :3] = R
+
+        # Update metadata to track that this correction was applied
+        if new_traj.metadata is None:
+            new_traj.metadata = {}
+        new_traj.metadata["left_right_flip_corrected"] = True
+
+        print("Applied left-right flip correction to trajectory")
+        print("  Negated first column of rotation matrices (camera X-axis)")
+
+        return new_traj
+
 
 @click.command()
 @click.argument("input-path", type=click.Path(path_type=Path, dir_okay=False))
@@ -356,6 +399,32 @@ def view(
     )
 
 
+@click.command()
+@click.argument("input-path", type=click.Path(path_type=Path, dir_okay=False, exists=True))
+@click.option("-o", "--output-path", type=click.Path(path_type=Path, exists=False), required=True)
+def fix_flip(input_path: Path, output_path: Path):
+    """
+    Fix left-right flip in trajectories generated with old generate_trajectory.py.
+
+    This corrects trajectories that were generated before the fix where the right
+    vector was computed incorrectly, causing rendered videos to be left-right flipped.
+
+    Example:
+        python trajectory_data.py fix-flip old_traj.npz -o fixed_traj.npz
+    """
+    print(f"Loading trajectory from {input_path}...")
+    traj = TrajectoryData.load(input_path)
+
+    print("\nApplying left-right flip correction...")
+    fixed_traj = traj.fix_left_right_flip()
+
+    print(f"\nSaving corrected trajectory to {output_path}...")
+    fixed_traj.save(output_path)
+
+    print("\n✓ Done! The corrected trajectory should now render without left-right flip.")
+    print("  Test by rendering with: render_trajectory.py --traj-file " + str(output_path))
+
+
 @click.group()
 def main():
     pass
@@ -363,6 +432,7 @@ def main():
 
 main.add_command(view, name="view")
 main.add_command(edit_traj, name="edit")
+main.add_command(fix_flip, name="fix-flip")
 
 if __name__ == "__main__":
     main()

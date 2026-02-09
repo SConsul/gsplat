@@ -134,7 +134,7 @@ def generate_wall_trajectory(
         forward = np.array([forward_xy[0], forward_xy[1], 0.0])
 
         # Right vector (perpendicular to forward in XY plane, Z is up)
-        right = np.array([forward[1], -forward[0], 0.0])
+        right = np.array([-forward[1], forward[0], 0.0])
         right = right / (np.linalg.norm(right) + 1e-8)
 
         # Apply pitch rotation around the right axis (positive pitch = look down)
@@ -259,7 +259,7 @@ def generate_elevated_trajectory(
         forward = np.array([forward_xy[0], forward_xy[1], 0.0])
 
         # Right vector (perpendicular to forward in XY plane, Z is up)
-        right = np.array([forward[1], -forward[0], 0.0])
+        right = np.array([-forward[1], forward[0], 0.0])
         right = right / (np.linalg.norm(right) + 1e-8)
 
         # Apply pitch rotation around the right axis (positive pitch = look down)
@@ -409,7 +409,7 @@ def generate_trajectory_from_selected_points(
         forward_xy = forward_xy / (np.linalg.norm(forward_xy) + 1e-8)
         forward = np.array([forward_xy[0], forward_xy[1], 0.0])
 
-        right = np.array([forward[1], -forward[0], 0.0])
+        right = np.array([-forward[1], forward[0], 0.0])
         right = right / (np.linalg.norm(right) + 1e-8)
 
         cos_p = np.cos(pitch_rad)
