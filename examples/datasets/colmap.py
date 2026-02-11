@@ -263,6 +263,11 @@ class Parser:
         self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
         self.transform = transform  # np.ndarray, (4, 4)
 
+        print(f"[Parser]: num points {self.points.shape[0]}")
+        print(f"\n[Parser]: Scene bounds:")
+        print(f"  X: [{self.points[:, 0].min():.3f}, {self.points[:, 0].max():.3f}]")
+        print(f"  Y: [{self.points[:, 1].min():.3f}, {self.points[:, 1].max():.3f}]")
+        print(f"  Z: [{self.points[:, 2].min():.3f}, {self.points[:, 2].max():.3f}]")
         # load one image to check the size. In the case of tanksandtemples dataset, the
         # intrinsics stored in COLMAP corresponds to 2x upsampled images.
         if len(self.image_paths) > 0:

@@ -1,5 +1,5 @@
 from colmap_loader import MyColmap
-import open3d as o3d
+
 import numpy as np
 from typing import TYPE_CHECKING
 
@@ -13,6 +13,7 @@ def view_pcd_with_traj(
     frustum_skip: int = 20,
     sphere_skip: int = 10,
 ):
+    import open3d as o3d
     # Calculate scene extent for scaling
     scene_extent = pcd.extent
     max_extent = max(scene_extent)

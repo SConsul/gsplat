@@ -2,7 +2,6 @@ from dataclasses import dataclass
 import copy
 
 from colmap_loader import load_pcd_from_dir
-import open3d as o3d
 import json
 from pathlib import Path
 from viz_utils import view_pcd_with_traj

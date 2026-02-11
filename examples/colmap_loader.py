@@ -3,7 +3,6 @@ from datasets.colmap import Parser
 from dataclasses import dataclass
 import numpy as np
 
-import open3d as o3d
 
 @dataclass
 class MyColmap:
@@ -20,6 +19,8 @@ class MyColmap:
         return self.points.max(axis=0) - self.points.min(axis=0)
     
     def viz_o3d(self, show_cam: bool=False) -> "o3d.geometry.PointCloud":
+        import open3d as o3d
+
         if show_cam:
             combined_points = np.vstack([self.points, self.cam_positions])
             cam_colors = np.array([[0.0, 1.0, 0.0]] * len(self.cam_positions))  # Green for cameras

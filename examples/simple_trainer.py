@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
+from dump import dump_config_yaml
 import imageio
 import numpy as np
 import torch
@@ -383,6 +384,9 @@ class Runner:
 
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
+        
+        # dump all config into a file in result_dir
+        dump_config_yaml(cfg, f"{cfg.result_dir}/config.yaml", omit_defaults=False)
 
         # Setup output directories.
         self.ckpt_dir = f"{cfg.result_dir}/ckpts"
@@ -681,7 +685,7 @@ class Runner:
                 trainloader_iter = iter(trainloader)
                 data = next(trainloader_iter)
 
-            depth_lambda = scheduled_hypers(step, cfg.depth_lambda)
+            depth_lambda = cfg.depth_lambda # scheduled_hypers(step, cfg.depth_lambda)
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
@@ -694,6 +698,8 @@ class Runner:
             #     pixels = resize(pixels, data_factor)
             #     if rgb_mask is not None:
             #         rgb_mask = resize(rgb_mask.unsqueeze(-1).float(), data_factor).squeeze(-1).bool()
+            #     if depth_mask is not None:
+            #         depth_mask = resize(depth_mask.unsqueeze(-1).float(), data_factor).squeeze(-1).bool()
             
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
