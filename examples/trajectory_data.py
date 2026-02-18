@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import copy
+from enum import StrEnum
 
 from colmap_loader import load_pcd_from_dir
 import json
@@ -8,6 +9,17 @@ from viz_utils import view_pcd_with_traj
 import numpy as np
 import click
 
+class TrajectoryType(StrEnum):
+    INTERP = "interp"
+    ELLIPSE = "ellipse"
+    SPIRAL = "spiral"
+    WALL = "wall"
+    ORIG_CAMS = "orig_cams"
+    ELEVATED_CAMS = "elevated_cams"
+    
+class WallTrajectoryShape(StrEnum):
+    ELLIPSE = "ellipse"
+    RECTANGLE = "rectangle"
 
 @dataclass
 class TrajectoryData:

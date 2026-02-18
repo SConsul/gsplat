@@ -4,9 +4,14 @@ Trajectory utilities for camera path generation and manipulation.
 
 from pathlib import Path
 from typing import Optional, Literal
-from colmap_loader import colmap_parser, load_pcd_from_dir
-from viz_utils import create_camera_frustum, create_trajectory_lineset, create_trajectory_spheres
-from trajectory_data import TrajectoryData
+import click
+from colmap_loader import load_pcd_from_dir, setup_image_directory
+from viz_utils import (
+    create_camera_frustum,
+    create_trajectory_lineset,
+    create_trajectory_spheres,
+)
+from trajectory_data import TrajectoryData, TrajectoryType
 import numpy as np
 
 
@@ -336,7 +341,7 @@ def generate_trajectory_from_selected_points(
     else:
         center = positions[:, :2].mean(axis=0)  # Use centroid
 
-    print(f"\n[Selected Points Trajectory]")
+    print("\n[Selected Points Trajectory]")
     print(f"  Selected points: {n_selected}")
     print(f"  Center: ({center[0]:.3f}, {center[1]:.3f})")
     print(f"  Height: {positions[0, 2]:.3f}")
@@ -389,7 +394,7 @@ def generate_trajectory_from_selected_points(
     n_frames = len(positions)
     print(f"  Total frames: {n_frames}")
     if closed_loop:
-        print(f"  Loop closed: first and last positions are identical")
+        print("  Loop closed: first and last positions are identical")
 
     # Build camera-to-world transforms
     camtoworlds_out = np.zeros((n_frames, 4, 4))
@@ -471,7 +476,7 @@ def interactive_pick_trajectory(
 
     print(f"Loading COLMAP data from {data_dir}...")
     colmap = load_pcd_from_dir(data_dir, save=False)
-    
+
     pcd = colmap.viz_o3d(show_cam=True)
 
     # Determine default height if not provided
@@ -497,10 +502,10 @@ def interactive_pick_trajectory(
         print("  2. [SHIFT + RIGHT CLICK] to undo point picking")
         print("  3. Can pick multiple times - LAST click will be used")
         print("  4. Press 'Q' to close window and move to waypoint selection")
-        print(f"\nTips:")
-        print(f"  - GREEN points = original camera positions")
-        print(f"  - Only XY coordinate is used; Z is set by height parameter")
-        print(f"  - Picked point will be shown with CYAN sphere in next view")
+        print("\nTips:")
+        print("  - GREEN points = original camera positions")
+        print("  - Only XY coordinate is used; Z is set by height parameter")
+        print("  - Picked point will be shown with CYAN sphere in next view")
         print(f"{'=' * 60}\n")
 
         vis_center = o3d.visualization.VisualizerWithEditing()
@@ -513,7 +518,7 @@ def interactive_pick_trajectory(
         vis_center.run()
         picked_center = vis_center.get_picked_points()
         vis_center.destroy_window()
-        
+
         combined_points = np.vstack([colmap.points, colmap.cam_positions])
         n_scene_points = colmap.points.shape[0]
 
@@ -524,19 +529,25 @@ def interactive_pick_trajectory(
             center_point_xy = center_pos[:2]
             point_type = "camera" if center_idx >= n_scene_points else "scene"
             if len(picked_center) > 1:
-                print(f"\nPicked {len(picked_center)} points, using LAST one as center:")
-            print(f"  CENTER: [{point_type}] XY=({center_pos[0]:.3f}, {center_pos[1]:.3f})")
+                print(
+                    f"\nPicked {len(picked_center)} points, using LAST one as center:"
+                )
+            print(
+                f"  CENTER: [{point_type}] XY=({center_pos[0]:.3f}, {center_pos[1]:.3f})"
+            )
 
             # Show preview with ONLY the latest center point
-            print("\n" + "="*60)
+            print("\n" + "=" * 60)
             print("PREVIEW: Selected Center (Latest Only)")
-            print("="*60)
+            print("=" * 60)
             print("  - CYAN sphere = your selected center (latest pick only)")
             print("Close window to continue...")
-            print("="*60 + "\n")
+            print("=" * 60 + "\n")
 
             vis_preview = o3d.visualization.Visualizer()
-            vis_preview.create_window(window_name="Preview: Center", width=1280, height=720)
+            vis_preview.create_window(
+                window_name="Preview: Center", width=1280, height=720
+            )
             vis_preview.add_geometry(pcd)
 
             # Render ONLY the latest center point with large cyan sphere
@@ -565,17 +576,19 @@ def interactive_pick_trajectory(
     print("  2. [SHIFT + RIGHT CLICK] to undo point picking")
     print("  3. Click points in the ORDER you want the trajectory to follow")
     print("  4. Press 'Q' to close window and generate trajectory")
-    print(f"\nSettings:")
+    print("\nSettings:")
     print(f"  - Mode: {'Look at center' if look_at_center else 'Follow loop'}")
     print(f"  - Height: {height:.3f}")
     print(f"  - Pitch: {pitch_degrees}°")
     print(f"  - Closed loop: {closed_loop}")
-    print(f"\nTips:")
-    print(f"  - GREEN points = original camera positions")
+    print("\nTips:")
+    print("  - GREEN points = original camera positions")
     if center_point_xy is not None:
-        print(f"  - Center point (CYAN sphere) will be shown in preview")
-    print(f"  - Only XY coordinates are used from clicks; Z is set by height={height:.3f}")
-    print(f"  - Selected waypoints will be shown with YELLOW spheres in preview")
+        print("  - Center point (CYAN sphere) will be shown in preview")
+    print(
+        f"  - Only XY coordinates are used from clicks; Z is set by height={height:.3f}"
+    )
+    print("  - Selected waypoints will be shown with YELLOW spheres in preview")
     print(f"{'=' * 60}\n")
 
     vis_waypoints = o3d.visualization.VisualizerWithEditing()
@@ -598,7 +611,9 @@ def interactive_pick_trajectory(
     try:
         for i, idx in enumerate(picked_waypoints, start=1):
             if idx >= len(combined_points):
-                print(f"ERROR: Index {idx} out of bounds (max {len(combined_points)-1})")
+                print(
+                    f"ERROR: Index {idx} out of bounds (max {len(combined_points) - 1})"
+                )
                 return None
             pos = combined_points[idx]
             waypoint_positions_xy.append(pos[:2])  # Only XY
@@ -611,24 +626,27 @@ def interactive_pick_trajectory(
     except Exception as e:
         print(f"\nERROR processing waypoints: {e}")
         import traceback
+
         traceback.print_exc()
         return None
 
     # Show preview with picked points as large spheres
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("PREVIEW: Picked Points")
-    print("="*60)
+    print("=" * 60)
     print("Showing your selections with large spheres:")
     if center_point_xy is not None:
         print("  - CYAN sphere = center point")
     print("  - YELLOW spheres = waypoints")
     print("  - GREEN points = original cameras")
     print("Close window to continue...")
-    print("="*60 + "\n")
+    print("=" * 60 + "\n")
 
     try:
         vis_preview = o3d.visualization.Visualizer()
-        vis_preview.create_window(window_name="Preview: Picked Points", width=1280, height=720)
+        vis_preview.create_window(
+            window_name="Preview: Picked Points", width=1280, height=720
+        )
         vis_preview.add_geometry(pcd)
 
         # Show center point with large cyan sphere
@@ -658,6 +676,7 @@ def interactive_pick_trajectory(
     except Exception as e:
         print(f"\nERROR creating preview window: {e}")
         import traceback
+
         traceback.print_exc()
         # Continue anyway - preview is optional
 
@@ -736,7 +755,9 @@ def interactive_pick_trajectory(
     print("\nShowing generated trajectory...")
 
     # Calculate scene-relative sphere sizes for final visualization
-    final_camera_radius = max(scene_extent) * 0.005  # 0.5% for original camera positions
+    final_camera_radius = (
+        max(scene_extent) * 0.005
+    )  # 0.5% for original camera positions
     final_waypoint_radius = max(scene_extent) * 0.01  # 1% for waypoints
     final_center_radius = max(scene_extent) * 0.015  # 1.5% for center
 
@@ -781,7 +802,6 @@ def interactive_pick_trajectory(
         vis2.add_geometry(lineset)
 
         # Helper function to create camera frustum
-        
 
         # Show camera frustums at intervals along trajectory
         frustum_size = max(scene_extent) * 0.05  # 5% of scene extent
@@ -791,13 +811,15 @@ def interactive_pick_trajectory(
             frustum = create_camera_frustum(
                 trajectory[i],
                 size=frustum_size,
-                color=[1.0, 0.5, 0.0]  # Orange
+                color=[1.0, 0.5, 0.0],  # Orange
             )
             vis2.add_geometry(frustum)
 
         # Show trajectory camera positions as small spheres
         for i, pos in enumerate(traj_positions[::skip]):
-            sphere = o3d.geometry.TriangleMesh.create_sphere(radius=final_camera_radius * 0.5)
+            sphere = o3d.geometry.TriangleMesh.create_sphere(
+                radius=final_camera_radius * 0.5
+            )
             sphere.translate(pos)
             sphere.paint_uniform_color([1.0, 0.0, 0.0])  # Red
             vis2.add_geometry(sphere)
@@ -814,7 +836,9 @@ def interactive_pick_trajectory(
     print("  RED line       = Generated trajectory path")
     print("  RED spheres    = Trajectory camera positions")
     print("  ORANGE frustums = Camera view frustums (orientation)")
-    print("\nNote: Frustums show camera orientation - pointing direction and field of view")
+    print(
+        "\nNote: Frustums show camera orientation - pointing direction and field of view"
+    )
 
     vis2.run()
     vis2.destroy_window()
@@ -1229,9 +1253,7 @@ def generate_render_traj_offset_up(
     return camtoworlds
 
 
-
-
-def view_trajectory(
+def generate_fixed_trajectory(
     data_dir: Path,
     traj_before: Optional[np.ndarray] = None,
     traj_after: Optional[np.ndarray] = None,
@@ -1267,7 +1289,7 @@ def view_trajectory(
     import open3d as o3d
 
     # Load point cloud and camera data
-    pcd, scene_scale = load_pcd_from_dir(data_dir)
+    pcd, scene_scale = load_pcd_from_dir(data_dir, save=False)
 
     geometries = [pcd]
 
@@ -1413,129 +1435,34 @@ def save_baseline_trajectory(
 
     return output_path
 
-
-def save_trajectory_comparison_image(
-    data_dir: Path,
-    output_path: Path,
-    traj_before: Optional[np.ndarray] = None,
-    traj_after: Optional[np.ndarray] = None,
-    up_offset_meters: float = 0.1,
-    traj_type: Literal["interp", "ellipse", "spiral", "wall"] = "interp",
-    width: int = 1920,
-    height: int = 1080,
-    wall_height: Optional[float] = None,
-    wall_pitch_degrees: float = 15.0,
-    wall_distance: float = 1.2,
-    wall_shape: Literal["rectangle", "ellipse"] = "ellipse",
-    n_frames: Optional[int] = None,
-):
-    """
-    Save a rendered image of the trajectory comparison (non-interactive).
-
-    Args:
-        data_dir: Path to COLMAP dataset directory
-        output_path: Path to save the output image
-        traj_before: Original trajectory [N, 4, 4] (blue)
-        traj_after: Offset trajectory [N, 4, 4] (red)
-        up_offset_meters: Offset to apply if traj_after not provided
-        traj_type: Trajectory type to generate
-        width: Image width
-        height: Image height
-        wall_height: Camera height for wall trajectory
-        wall_pitch_degrees: Downward pitch for wall trajectory
-        wall_distance: How close to walls for wall trajectory
-        wall_shape: Path shape for wall trajectory
-        n_frames: Number of frames in trajectory
-    """
-    import open3d as o3d
-
-    # Load data
-    points, colors, camtoworlds_original, scene_scale = colmap_parser(data_dir)
-    parser = Parser(str(data_dir), factor=1, normalize=True, test_every=8)
-
-    if traj_before is None:
-        traj_before = generate_trajectory_from_parser(
-            parser,
-            traj_type="interp",
-            scene_scale=scene_scale,
-            n_frames=n_frames,
-        )
-
-    if traj_after is None:
-        traj_after = generate_trajectory_from_parser(
-            parser,
-            traj_type=traj_type,
-            scene_scale=scene_scale,
-            n_frames=n_frames,
-            elevation=wall_height,
-            pitch_degrees=wall_pitch_degrees,
-            wall_distance=wall_distance,
-            wall_shape=wall_shape,
-        )
-
-    # Create geometries
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    pcd.colors = o3d.utility.Vector3dVector(colors)
-
-    subsample = max(1, len(traj_before) // 200)
-
-    lineset_before = create_trajectory_lineset(
-        traj_before, color=[0.0, 0.0, 1.0], subsample=subsample
-    )
-    lineset_after = create_trajectory_lineset(
-        traj_after, color=[1.0, 0.0, 0.0], subsample=subsample
-    )
-
-    # Setup visualizer for offscreen rendering
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(width=width, height=height, visible=False)
-
-    vis.add_geometry(pcd)
-    vis.add_geometry(lineset_before)
-    vis.add_geometry(lineset_after)
-
-    # Add coordinate frame at origin
-    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
-    vis.add_geometry(coord_frame)
-
-    # Set view
-    ctr = vis.get_view_control()
-    ctr.set_zoom(0.5)
-
-    # Render and save
-    vis.poll_events()
-    vis.update_renderer()
-    vis.capture_screen_image(str(output_path))
-    vis.destroy_window()
-
-    print(f"Saved trajectory comparison to {output_path}")
-
-
-if __name__ == "__main__":
+@click.command()
+@click.argument("data-dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("-t", "--traj-type", type=click.Choice(TrajectoryType))
+@click.option("-s/-ns", "--save-image/--no-save-image", default=True) # Save image instead of interactive view
+def main():
     import argparse
 
     arg_parser = argparse.ArgumentParser(
         description="Visualize camera trajectories on point cloud"
     )
-    arg_parser.add_argument(
-        "--data-dir", type=str, required=True, help="Path to COLMAP dataset"
-    )
+    # arg_parser.add_argument(
+    #     "--data-dir", type=str, required=True, help="Path to COLMAP dataset"
+    # )
     arg_parser.add_argument(
         "--up-offset", type=float, default=0.1, help="Up offset in meters"
     )
-    arg_parser.add_argument(
-        "--traj-type",
-        type=str,
-        default="interp",
-        choices=["interp", "ellipse", "spiral", "wall", "elevated", "colmap"],
-    )
-    arg_parser.add_argument(
-        "--save-image",
-        type=str,
-        default=None,
-        help="Save image instead of interactive view",
-    )
+    # arg_parser.add_argument(
+    #     "--traj-type",
+    #     type=str,
+    #     default="interp",
+    #     choices=["interp", "ellipse", "spiral", "wall", "elevated", "colmap"],
+    # )
+    # arg_parser.add_argument(
+    #     "--save-image",
+    #     type=str,
+    #     default=None,
+    #     help="Save image instead of interactive view",
+    # )
 
     # Interactive picking mode
     arg_parser.add_argument(
@@ -1628,7 +1555,7 @@ if __name__ == "__main__":
 
     if args.pick:
         # Interactive picking mode
-        interactive_pick_trajectory(
+        traj_data = interactive_pick_trajectory(
             data_dir,
             height=args.wall_height,
             pitch_degrees=args.wall_pitch,
@@ -1638,26 +1565,31 @@ if __name__ == "__main__":
             pick_center=args.pick_center,
             output_path=Path(args.pick_output) if args.pick_output else None,
         )
-    # elif args.save_image:
-    #     save_trajectory_comparison_image(
-    #         data_dir,
-    #         output_path=Path(args.save_image),
-    #         up_offset_meters=args.up_offset,
-    #         traj_type=args.traj_type,
-    #         wall_height=args.wall_height,
-    #         wall_pitch_degrees=args.wall_pitch,
-    #         wall_distance=args.wall_distance,
-    #         wall_shape=args.wall_shape,
-    #         n_frames=args.n_frames,
-    #     )
-    # else:
-    #     view_trajectory(
-    #         data_dir,
-    #         up_offset_meters=args.up_offset,
-    #         traj_type=args.traj_type,
-    #         wall_height=args.wall_height,
-    #         wall_pitch_degrees=args.wall_pitch,
-    #         wall_distance=args.wall_distance,
-    #         wall_shape=args.wall_shape,
-    #         n_frames=args.n_frames,
-    #     )
+    else:
+        traj_data = generate_fixed_trajectory(
+            data_dir,
+            up_offset_meters=args.up_offset,
+            traj_type=args.traj_type,
+            wall_height=args.wall_height,
+            wall_pitch_degrees=args.wall_pitch,
+            wall_distance=args.wall_distance,
+            wall_shape=args.wall_shape,
+            n_frames=args.n_frames,
+        )
+    
+    if traj_data is not None:
+        # Save trajectory
+        if output_path is not None:
+            if trajectory is not None:
+                traj_data.save(output_path)
+                print(
+                    f"  python render_trajectory.py --data-dir {data_dir} --ckpt <checkpoint.pt> \\"
+                )
+                print(f"      --traj-file {output_path} -o output.mp4")
+
+        # Visualize the result
+        print("\nShowing generated trajectory...")
+
+
+if __name__ == "__main__":
+    main()
