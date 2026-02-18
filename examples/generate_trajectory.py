@@ -470,7 +470,7 @@ def interactive_pick_trajectory(
     import open3d as o3d
 
     print(f"Loading COLMAP data from {data_dir}...")
-    colmap = load_pcd_from_dir(data_dir)
+    colmap = load_pcd_from_dir(data_dir, save=False)
     
     pcd = colmap.viz_o3d(show_cam=True)
 
@@ -513,6 +513,9 @@ def interactive_pick_trajectory(
         vis_center.run()
         picked_center = vis_center.get_picked_points()
         vis_center.destroy_window()
+        
+        combined_points = np.vstack([colmap.points, colmap.cam_positions])
+        n_scene_points = colmap.points.shape[0]
 
         if len(picked_center) > 0:
             # Use the last picked point as center
@@ -743,7 +746,7 @@ def interactive_pick_trajectory(
     vis2.add_geometry(pcd)
 
     # Show original cameras in green (small)
-    for pos in cam_positions:
+    for pos in colmap.cam_positions:
         sphere = o3d.geometry.TriangleMesh.create_sphere(radius=final_camera_radius)
         sphere.translate(pos)
         sphere.paint_uniform_color([0.0, 1.0, 0.0])

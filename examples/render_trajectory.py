@@ -191,25 +191,37 @@ def load_trajectory_from_json(
 
 
 def load_checkpoint(
-    ckpt_path: str, device: str = "cuda"
+    ckpt_path, device: str = "cuda"
 ) -> Tuple[torch.nn.ParameterDict, int]:
     """
-    Load splats from checkpoint.
+    Load splats from one or more checkpoint files.
+
+    For distributed training, each rank saves a separate checkpoint containing
+    a shard of the splats. Pass all rank checkpoints to concatenate them.
 
     Args:
-        ckpt_path: Path to checkpoint file
+        ckpt_path: Path to checkpoint file, or list of paths for multi-rank checkpoints
         device: Device to load to
 
     Returns:
         Tuple of (splats ParameterDict, step number)
     """
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    if isinstance(ckpt_path, (list, tuple)):
+        ckpt_paths = ckpt_path
+    else:
+        ckpt_paths = [ckpt_path]
+
+    ckpts = [
+        torch.load(p, map_location=device, weights_only=False) for p in ckpt_paths
+    ]
 
     splats = torch.nn.ParameterDict()
-    for k, v in ckpt["splats"].items():
-        splats[k] = torch.nn.Parameter(v.to(device))
+    for k in ckpts[0]["splats"].keys():
+        splats[k] = torch.nn.Parameter(
+            torch.cat([ckpt["splats"][k] for ckpt in ckpts]).to(device)
+        )
 
-    step = ckpt.get("step", 0)
+    step = ckpts[0].get("step", 0)
     return splats, step
 
 
@@ -789,8 +801,9 @@ Examples:
     parser.add_argument(
         "--ckpt",
         type=str,
+        nargs="+",
         default=None,
-        help="Path to checkpoint file (required for video rendering)",
+        help="Path to checkpoint file(s). For distributed training, pass all rank checkpoints to concatenate them.",
     )
     parser.add_argument(
         "--output",

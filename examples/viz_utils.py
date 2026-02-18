@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from trajectory_data import TrajectoryData
+    import open3d as o3d
 
 
 def view_pcd_with_traj(
@@ -144,6 +145,8 @@ def create_trajectory_spheres(
     Returns:
         List of Open3D sphere meshes
     """
+    import open3d as o3d
+
     positions = camtoworlds[::subsample, :3, 3]
     spheres = []
 
@@ -160,6 +163,8 @@ def create_camera_frustum(
     pose, size=0.1, color=[1.0, 0.0, 0.0]
 ) -> "o3d.geometry.LineSet":
     """Create a camera frustum wireframe."""
+    import open3d as o3d
+
     # Camera center
     center = pose[:3, 3]
 

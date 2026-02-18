@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 from dump import dump_config_yaml
+from trajectory_data import TrajectoryData
 import imageio
 import numpy as np
 import torch
@@ -116,6 +117,8 @@ class Config:
     data_factor: int = 4
     # Directory to save results
     result_dir: str = "results/garden"
+    # Path to evaluation trajectory
+    eval_traj_file: str | None = None
     # Every N images there is a test image
     test_every: int = 8
     # Random crop size for training  (experimental)
@@ -1135,8 +1138,10 @@ class Runner:
         print("Running trajectory rendering...")
         cfg = self.cfg
         device = self.device
-
-        camtoworlds_all = self.parser.camtoworlds[5:-5]
+        
+        # only render for front0 camera
+        front0_entries = ["front0" in name for name in self.parser.image_names]
+        camtoworlds_all = self.parser.camtoworlds[front0_entries]
         if cfg.render_traj_path == "interp":
             camtoworlds_all = generate_interpolated_path(
                 camtoworlds_all, 1
@@ -1170,11 +1175,29 @@ class Runner:
         camtoworlds_all = torch.from_numpy(camtoworlds_all).float().to(device)
         K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
         width, height = list(self.parser.imsize_dict.values())[0]
-
-        # save to video
+        
         video_dir = f"{cfg.result_dir}/videos"
         os.makedirs(video_dir, exist_ok=True)
-        writer = imageio.get_writer(f"{video_dir}/traj_{step}.mp4", fps=30)
+        
+        self.save_video(K, height, width, cfg.sh_degree, cfg.near_plane, cfg.far_plane, f"{video_dir}/traj_{step}.mp4", camtoworlds_all)
+        
+        # save to video
+        if cfg.eval_traj_file is not None:
+            traj_data = TrajectoryData.load(cfg.eval_traj_file)
+            eval_camtoworlds = torch.from_numpy(traj_data.camtoworlds).float().to(device)
+            # Override parser intrinsics with trajectory intrinsics if available
+            if traj_data.intrinsics is not None:
+                K = torch.from_numpy(traj_data.intrinsics).float().to(device)
+                width = traj_data.width
+                height = traj_data.height
+                print(f"Using intrinsics from trajectory file: {width}x{height}")
+                self.save_video(K, height, width, cfg.sh_degree, cfg.near_plane, cfg.far_plane, f"{video_dir}/traj_{step}_path.mp4", eval_camtoworlds)
+                
+        
+        
+
+    def save_video(self, K, height, width,  sh_degree: int, near_plane: float, far_plane: float, video_path: str, camtoworlds_all):
+        writer = imageio.get_writer(video_path, fps=30)
         for i in tqdm.trange(len(camtoworlds_all), desc="Rendering trajectory"):
             camtoworlds = camtoworlds_all[i : i + 1]
             Ks = K[None]
@@ -1184,9 +1207,9 @@ class Runner:
                 Ks=Ks,
                 width=width,
                 height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
+                sh_degree=sh_degree,
+                near_plane=near_plane,
+                far_plane=far_plane,
                 render_mode="RGB+ED",
             )  # [1, H, W, 4]
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
@@ -1199,7 +1222,7 @@ class Runner:
             canvas = (canvas * 255).astype(np.uint8)
             writer.append_data(canvas)
         writer.close()
-        print(f"Video saved to {video_dir}/traj_{step}.mp4")
+        print(f"Video saved to {video_path}")
 
     @torch.no_grad()
     def run_compression(self, step: int):
