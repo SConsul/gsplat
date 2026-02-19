@@ -14,8 +14,8 @@ class TrajectoryType(StrEnum):
     ELLIPSE = "ellipse"
     SPIRAL = "spiral"
     WALL = "wall"
-    ORIG_CAMS = "orig_cams"
-    ELEVATED_CAMS = "elevated_cams"
+    ELEVATED = "elevated"
+    COLMAP = "colmap"
     
 class WallTrajectoryShape(StrEnum):
     ELLIPSE = "ellipse"
