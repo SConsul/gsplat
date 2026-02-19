@@ -12,10 +12,10 @@ Usage:
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
-import argparse
 import json
 import os
+
+import click
 
 import numpy as np
 import torch
@@ -119,7 +119,7 @@ def transform_cameras(matrix: np.ndarray, camtoworlds: np.ndarray) -> np.ndarray
 
 def load_trajectory_from_json(
     json_path: Path,
-    parser_transform: Optional[np.ndarray] = None,
+    parser_transform: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Load a trajectory from a JSON file produced by an external tool.
@@ -160,9 +160,9 @@ def load_trajectory_from_json(
 
 
 def load_checkpoint(
-    ckpt_path: Union[str, Path, List[Union[str, Path]]],
+    ckpt_paths: list[Path],
     device: str = "cuda",
-) -> Tuple[torch.nn.ParameterDict, int]:
+) -> tuple[torch.nn.ParameterDict, int]:
     """
     Load splat parameters from one or more checkpoint files.
 
@@ -175,10 +175,7 @@ def load_checkpoint(
     Returns:
         Tuple of (splats ParameterDict, training step number).
     """
-    paths: List[Union[str, Path]] = (
-        [ckpt_path] if isinstance(ckpt_path, (str, Path)) else list(ckpt_path)
-    )
-    ckpts = [torch.load(p, map_location=device, weights_only=False) for p in paths]
+    ckpts = [torch.load(p, map_location=device, weights_only=False) for p in ckpt_paths]
 
     splats = torch.nn.ParameterDict()
     for k in ckpts[0]["splats"]:
@@ -202,7 +199,7 @@ def rasterize_splats(
     sh_degree: int = 3,
     render_mode: str = "RGB+ED",
     camera_model: str = "pinhole",
-) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
     """
     Rasterize splats for the given camera poses.
 
@@ -249,7 +246,7 @@ def project_points_to_image(
     K: np.ndarray,
     width: int,
     height: int,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Project 3D world-space points to 2D image coordinates.
 
@@ -278,7 +275,7 @@ def draw_trajectory_on_image(
     trajectory_positions: np.ndarray,
     camtoworld: np.ndarray,
     K: np.ndarray,
-    color: Tuple[int, int, int] = (255, 0, 0),
+    color: tuple[int, int, int] = (255, 0, 0),
     point_radius: int = 3,
     line_thickness: int = 2,
     subsample: int = 1,
@@ -386,83 +383,14 @@ def render_trajectory_to_video(
     print(f"Video saved to {output_path}")
 
 
-@torch.no_grad()
-def render_dual_trajectory_video(
-    splats: torch.nn.ParameterDict,
-    original_camtoworlds: np.ndarray,
-    offset_camtoworlds: np.ndarray,
-    K: np.ndarray,
-    width: int,
-    height: int,
-    output_path: str,
-    fps: int = 30,
-    near_plane: float = 0.01,
-    far_plane: float = 1e10,
-    sh_degree: int = 3,
-    device: str = "cuda",
-    flip: bool = True,
-) -> None:
-    """
-    Render a video with original trajectory (top) and offset trajectory (bottom),
-    each showing RGB + depth.
-
-    Args:
-        splats: ParameterDict with splat parameters.
-        original_camtoworlds: [N, 4, 4] original camera poses.
-        offset_camtoworlds: [N, 4, 4] offset camera poses.
-        K: [3, 3] camera intrinsics.
-        width: Render width in pixels.
-        height: Render height in pixels.
-        output_path: Destination MP4 path.
-        fps: Video frame rate.
-        near_plane: Near clipping plane distance.
-        far_plane: Far clipping plane distance.
-        sh_degree: Spherical harmonics degree.
-        device: PyTorch device string.
-        flip: If True flip frames vertically.
-    """
-    import cv2
-
-    orig_t = torch.from_numpy(original_camtoworlds).float().to(device)
-    offset_t = torch.from_numpy(offset_camtoworlds).float().to(device)
-    K_t = torch.from_numpy(K).float().to(device)
-    n_frames = min(len(orig_t), len(offset_t))
-
-    os.makedirs(
-        os.path.dirname(output_path) if os.path.dirname(output_path) else ".",
-        exist_ok=True,
-    )
-
-    def _render_row(c2w: torch.Tensor) -> torch.Tensor:
-        r, _, _ = rasterize_splats(
-            splats, c2w[None], K_t[None], width, height,
-            near_plane, far_plane, sh_degree, "RGB+ED",
-        )
-        rgb = torch.clamp(r[..., :3], 0.0, 1.0)
-        depth = r[..., 3:4]
-        depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
-        return torch.cat([rgb, depth.repeat(1, 1, 1, 3)], dim=2)
-
-    with imageio.get_writer(output_path, fps=fps) as writer:
-        for i in tqdm.trange(n_frames, desc="Rendering dual"):
-            canvas = torch.cat([_render_row(orig_t[i]), _render_row(offset_t[i])], dim=1)
-            frame = (canvas.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
-            cv2.putText(frame, "Original", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(frame, "Offset", (10, height + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            if flip:
-                frame = np.flip(frame, axis=0)
-            writer.append_data(frame)
-    print(f"Dual video saved to {output_path}")
-
-
 # ── Persistence ───────────────────────────────────────────────────────────────
 
 
 def save_trajectory(
     camtoworlds: np.ndarray,
     output_path: Path,
-    intrinsics: Optional[np.ndarray] = None,
-    image_size: Optional[Tuple[int, int]] = None,
+    intrinsics: np.ndarray | None = None,
+    image_size: tuple[int, int] | None = None,
 ) -> None:
     """
     Save a trajectory to .npy or .npz.
@@ -473,9 +401,8 @@ def save_trajectory(
         intrinsics: Optional [3, 3] intrinsics to embed in .npz.
         image_size: Optional (width, height) to embed in .npz.
     """
-    output_path = Path(output_path)
     if output_path.suffix == ".npz":
-        data: Dict[str, np.ndarray] = {"camtoworlds": camtoworlds}
+        data: dict[str, np.ndarray] = {"camtoworlds": camtoworlds}
         if intrinsics is not None:
             data["intrinsics"] = intrinsics
         if image_size is not None:
@@ -489,77 +416,72 @@ def save_trajectory(
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Render a Gaussian Splatting video from a trajectory file.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python render_trajectory.py --traj-file traj.npz --ckpt ckpt.pt -o video.mp4
-  python render_trajectory.py --traj-file traj.npz --ckpt ckpt.pt -o video.mp4 --up-offset 0.1
-  python render_trajectory.py --traj-file traj.npz --data-dir ./data -o out.npz --save-traj-only
-        """,
-    )
-
-    parser.add_argument(
-        "--traj-file", type=str, required=True,
-        help="Trajectory file (.npy, .npz, or .json). Required.",
-    )
-    parser.add_argument(
-        "--data-dir", type=str, default=None,
-        help="COLMAP data directory. Required when loading .json or .npy trajectories.",
-    )
-    parser.add_argument(
-        "--ckpt", type=str, nargs="+", default=None,
-        help="Checkpoint file(s). Pass multiple paths for distributed-training shards.",
-    )
-    parser.add_argument(
-        "-o", "--output", type=str, required=True,
-        help="Output file (.mp4 for video, .npy/.npz for trajectory).",
-    )
-    parser.add_argument("--offset-x", type=float, default=0.0, help="World-space X offset.")
-    parser.add_argument("--offset-y", type=float, default=0.0, help="World-space Y offset.")
-    parser.add_argument(
-        "--offset-z", type=float, default=0.0,
-        help="World-space Z offset (up is -Z in gsplat).",
-    )
-    parser.add_argument(
-        "--up-offset", type=float, default=None,
-        help="Move camera up by this many metres (shorthand: sets offset-z = -up-offset).",
-    )
-    parser.add_argument("--max-frames", type=int, default=None, help="Limit trajectory length.")
-    parser.add_argument("--data-factor", type=int, default=1, help="Image downsample factor.")
-    parser.add_argument("--scene-scale", type=float, default=None, help="Override scene scale.")
-    parser.add_argument("--sh-degree", type=int, default=3, help="Spherical harmonics degree.")
-    parser.add_argument("--fps", type=int, default=30, help="Video frames per second.")
-    parser.add_argument("--no-depth", action="store_true", help="Render RGB only (no depth).")
-    parser.add_argument(
-        "--save-traj-only", action="store_true",
-        help="Save trajectory file without rendering a video.",
-    )
-    parser.add_argument("--near-plane", type=float, default=0.01)
-    parser.add_argument("--far-plane", type=float, default=1e10)
-    parser.add_argument(
-        "--dual-video", action="store_true",
-        help="Render original (top) and offset (bottom) trajectories side by side.",
-    )
-    parser.add_argument(
-        "--flip", action="store_true",
-        help="Flip frames vertically (use when video appears upside down).",
-    )
-
-    args = parser.parse_args()
-
+@click.command()
+@click.option(
+    "--traj-file", type=click.Path(exists=True, path_type=Path), required=True,
+    help="Trajectory file (.npy, .npz, or .json).",
+)
+@click.option(
+    "--data-dir", type=click.Path(exists=True, file_okay=False, path_type=Path), default=None,
+    help="COLMAP data directory. Required for .json and .npy trajectories.",
+)
+@click.option(
+    "--ckpt", type=click.Path(exists=True, path_type=Path), multiple=True,
+    help="Checkpoint file(s). Repeat for distributed-training shards.",
+)
+@click.option(
+    "-o", "--output", type=click.Path(path_type=Path), required=True,
+    help="Output file (.mp4 for video, .npy/.npz for trajectory).",
+)
+@click.option("--offset-x", type=float, default=0.0, help="World-space X offset.")
+@click.option("--offset-y", type=float, default=0.0, help="World-space Y offset.")
+@click.option(
+    "--offset-z", type=float, default=0.0,
+    help="World-space Z offset (up is -Z in gsplat).",
+)
+@click.option(
+    "--up-offset", type=float, default=None,
+    help="Move camera up by this many metres (shorthand: negates offset-z).",
+)
+@click.option("--max-frames", type=int, default=None, help="Truncate trajectory to N frames.")
+@click.option("--data-factor", type=int, default=1, show_default=True, help="Image downsample factor.")
+@click.option("--scene-scale", type=float, default=None, help="Override auto-computed scene scale.")
+@click.option("--sh-degree", type=int, default=3, show_default=True, help="Spherical harmonics degree.")
+@click.option("--fps", type=int, default=30, show_default=True, help="Video frames per second.")
+@click.option("--no-depth", is_flag=True, default=False, help="Render RGB only (no depth).")
+@click.option("--save-traj-only", is_flag=True, default=False, help="Save trajectory without rendering.")
+@click.option("--near-plane", type=float, default=0.01, show_default=True)
+@click.option("--far-plane", type=float, default=1e10, show_default=True)
+@click.option("--flip", is_flag=True, default=False, help="Flip frames vertically.")
+def main(
+    traj_file: Path,
+    data_dir: Path | None,
+    ckpt: tuple[Path, ...],
+    output: Path,
+    offset_x: float,
+    offset_y: float,
+    offset_z: float,
+    up_offset: float | None,
+    max_frames: int | None,
+    data_factor: int,
+    scene_scale: float | None,
+    sh_degree: int,
+    fps: int,
+    no_depth: bool,
+    save_traj_only: bool,
+    near_plane: float,
+    far_plane: float,
+    flip: bool,
+) -> None:
+    """Render a Gaussian Splatting video from a trajectory file."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    output_path = Path(args.output)
-    is_video = output_path.suffix.lower() in {".mp4", ".avi", ".mov", ".webm"}
+    is_video = output.suffix.lower() in {".mp4", ".avi", ".mov", ".webm"}
 
-    if is_video and args.ckpt is None and not args.save_traj_only:
-        parser.error("--ckpt is required for video rendering.")
+    if is_video and not ckpt and not save_traj_only:
+        raise click.UsageError("--ckpt is required for video rendering.")
 
     # ── Load trajectory ───────────────────────────────────────────────────────
-    traj_path = Path(args.traj_file)
-    traj_suffix = traj_path.suffix.lower()
+    traj_suffix = traj_file.suffix.lower()
 
     K: np.ndarray
     img_w: int
@@ -568,54 +490,52 @@ Examples:
     _scene_scale: float
 
     if traj_suffix == ".json":
-        if args.data_dir is None:
-            parser.error("--data-dir is required when loading JSON trajectories.")
+        if data_dir is None:
+            raise click.UsageError("--data-dir is required when loading JSON trajectories.")
         try:
-            setup_image_directory(Path(args.data_dir), factor=args.data_factor)
+            setup_image_directory(data_dir, factor=data_factor)
         except Exception as e:
             print(f"Warning: {e}")
         colmap_parser = Parser(
-            data_dir=args.data_dir, factor=args.data_factor, normalize=True, test_every=8
+            data_dir=data_dir.as_posix(), factor=data_factor, normalize=True, test_every=8
         )
-        camtoworlds = load_trajectory_from_json(traj_path, colmap_parser.transform)
-        _scene_scale = args.scene_scale or colmap_parser.scene_scale * 1.1
+        camtoworlds = load_trajectory_from_json(traj_file, colmap_parser.transform)
+        _scene_scale = scene_scale or colmap_parser.scene_scale * 1.1
         first_cam = list(colmap_parser.Ks_dict.keys())[0]
         K = colmap_parser.Ks_dict[first_cam]
         img_w, img_h = colmap_parser.imsize_dict[first_cam]
 
     elif traj_suffix == ".npz":
-        traj_data = TrajectoryData.load(traj_path)
+        traj_data = TrajectoryData.load(traj_file)
         camtoworlds = traj_data.camtoworlds
         K = traj_data.intrinsics
         img_w, img_h = traj_data.width, traj_data.height
-        _scene_scale = args.scene_scale or 1.0
+        _scene_scale = scene_scale or 1.0
 
     else:  # .npy
-        if args.data_dir is None:
-            parser.error("--data-dir is required when loading .npy trajectories.")
-        camtoworlds = np.load(traj_path)
-        _scene_scale = args.scene_scale or 1.0
+        if data_dir is None:
+            raise click.UsageError("--data-dir is required when loading .npy trajectories.")
+        camtoworlds = np.load(traj_file)
+        _scene_scale = scene_scale or 1.0
         colmap_parser = Parser(
-            data_dir=args.data_dir, factor=args.data_factor, normalize=True, test_every=8
+            data_dir=data_dir.as_posix(), factor=data_factor, normalize=True, test_every=8
         )
         first_cam = list(colmap_parser.Ks_dict.keys())[0]
         K = colmap_parser.Ks_dict[first_cam]
         img_w, img_h = colmap_parser.imsize_dict[first_cam]
 
-    print(f"Loaded {len(camtoworlds)} poses from {traj_path}")
+    print(f"Loaded {len(camtoworlds)} poses from {traj_file}")
     print(f"Using scene_scale={_scene_scale:.4f}")
 
-    if args.max_frames is not None and args.max_frames > 0:
-        camtoworlds = camtoworlds[: args.max_frames]
+    if max_frames is not None and max_frames > 0:
+        camtoworlds = camtoworlds[:max_frames]
 
     # ── Apply offset ──────────────────────────────────────────────────────────
-    offset_z = args.offset_z
-    if args.up_offset is not None:
-        offset_z = -args.up_offset  # up is -Z in gsplat
+    if up_offset is not None:
+        offset_z = -up_offset  # up is -Z in gsplat
 
-    offset = np.array([args.offset_x, args.offset_y, offset_z])
+    offset = np.array([offset_x, offset_y, offset_z])
     has_offset = bool(np.any(offset != 0))
-    original_camtoworlds = camtoworlds
 
     if has_offset:
         scaled_offset = offset / _scene_scale
@@ -625,46 +545,29 @@ Examples:
     print(f"Using {len(camtoworlds)} poses")
 
     # ── Output ────────────────────────────────────────────────────────────────
-    if args.save_traj_only or not is_video:
-        save_trajectory(camtoworlds, output_path, intrinsics=K, image_size=(img_w, img_h))
+    if save_traj_only or not is_video:
+        save_trajectory(camtoworlds, output, intrinsics=K, image_size=(img_w, img_h))
         return
 
-    print(f"Loading checkpoint from {args.ckpt}...")
-    splats, step = load_checkpoint(args.ckpt, device=device)
+    print(f"Loading checkpoint from {list(ckpt)}...")
+    splats, step = load_checkpoint(list(ckpt), device=device)
     print(f"Loaded step={step}, {len(splats['means'])} Gaussians")
 
-    if args.dual_video and has_offset:
-        render_dual_trajectory_video(
-            splats=splats,
-            original_camtoworlds=original_camtoworlds,
-            offset_camtoworlds=camtoworlds,
-            K=K,
-            width=img_w,
-            height=img_h,
-            output_path=str(output_path),
-            fps=args.fps,
-            near_plane=args.near_plane,
-            far_plane=args.far_plane,
-            sh_degree=args.sh_degree,
-            device=device,
-            flip=args.flip,
-        )
-    else:
-        render_trajectory_to_video(
-            splats=splats,
-            camtoworlds=camtoworlds,
-            K=K,
-            width=img_w,
-            height=img_h,
-            output_path=str(output_path),
-            fps=args.fps,
-            near_plane=args.near_plane,
-            far_plane=args.far_plane,
-            sh_degree=args.sh_degree,
-            show_depth=not args.no_depth,
-            device=device,
-            flip=args.flip,
-        )
+    render_trajectory_to_video(
+        splats=splats,
+        camtoworlds=camtoworlds,
+        K=K,
+        width=img_w,
+        height=img_h,
+        output_path=str(output),
+        fps=fps,
+        near_plane=near_plane,
+        far_plane=far_plane,
+        sh_degree=sh_degree,
+        show_depth=not no_depth,
+        device=device,
+        flip=flip,
+    )
 
 
 if __name__ == "__main__":
